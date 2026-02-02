@@ -12,6 +12,18 @@
 WikipediaDPR_path = "C:/Users/findi/OneDrive/Desktop/AI Research Datasets/Wikipedia DPR Mini/" #base directory of Wikipedia DPR mini dataset
 testfile = WikipediaDPR_path + "Multiset/train-00000-of-00157.parquet" #current file selection
 
+#New Source settings 2/1/26+ [note: these 3 options only take effect when DATA_SELECTION_MODE = 3]
+DATA_SELECTION_METHOD = True
+#This determines if you directly choose the source file or if it is randomly chosen
+#True - [Default] Manual Selection
+#False - Random Selection
+
+RAND_BLOCK = True
+#This determines whether it chooses a random block for automation
+#True - [Random] will select a random valid starting location in the selected file
+#False - [Default] uses specified START_IND for starting location of block in selected file
+START_IND = 0 #starting index of block that is scanned
+
 NUM_ROWS = 768 #this is how many rows of vector embeddings will be processed
 NUM_DIMS = 768 #this is the number of weights per vector embedding
 
@@ -34,12 +46,15 @@ AC_MODE = 0 #0-4
 #3 - [Individual Row Bitplane Analysis] will print out compressibility of each row with 32 compressibility values
 #4 - [OFF]
 
-DATA_SELECTION_MODE = 2 #0-2
+DATA_SELECTION_MODE = 3 #0-3
 #DATA_SELECTION_MODE specifies how files and data are selected for the simulation
 #DATA_SELECTION_MODE has multiple settings:
-#0 - [Manual Selection, default] will only use the data you specify
+#0 - [Manual Selection] will only use the data you specify
 #1 - [File Selection - Random Block] will use the data file you specify, but will choose a random block of data within the file
 #2 - [Fully Random] will pick a random data file in your local dataset, then also pick a random block
+#3 - [Full Automation, default] will utilize file scanning locally or through internet streaming. This makes DATA_SELECTION_METHOD actually do something
+#new note: only use 0-2 when autoscan isn't finding your file (you would need to manually specify the file path)
+
 #helper functions below, they are used in parallel processing on the CPU side (and GPU side) to accelerate formatting and cast conversions
 
 DIRECT_COMPRESSION_COMPARISON = True
@@ -405,12 +420,31 @@ def AC_Analysis_BitPlane(bit_volume): #this is vibe coded, per vector compressib
 def initialization():
     import pandas
     import random
-    if(DATA_SELECTION_MODE > 0):
+    if((DATA_SELECTION_MODE > 0) and (DATA_SELECTION_MODE != 3)):
         global testfile
         selec = random.randint(0,3)
         choices = [WikipediaDPR_path + "Multiset/train-00156-of-00157.parquet", WikipediaDPR_path + "Multiset/train-00078-of-00157.parquet", WikipediaDPR_path + "Multiset/train-00000-of-00157.parquet", WikipediaDPR_path + "DummyMultiset/train-00000-of-00001.parquet"]
         testfile = choices[selec]
         print("File used: " + testfile)
+    elif(DATA_SELECTION_MODE == 3):
+        if(DATA_SELECTION_METHOD == True): #Manual file selection (autoscan)
+            #local relative file autoscan, scans nearby folders for .parquet files
+            from pathlib import Path
+            parquetfiles = list(Path('.').rglob('*.parquet'))
+            print("parquet files found, select via number: ")
+            ind = 0
+            while(ind < len(parquetfiles)):
+                print(str(ind) + ".) " + str(parquetfiles[ind]))
+                ind += 1
+            ms = int(input("Input path number here: "))
+            testfile = parquetfiles[ms]
+        elif(DATA_SELECTION_METHOD == False): #Randomized file selection (also with autoscan)
+            #local randomized file selection (autoscans local directories)
+            from pathlib import Path
+            import random
+            parquetfiles = list(Path('.').rglob('*.parquet'))
+            ms = random.randint(0, len(parquetfiles)-1)
+            testfile = parquetfiles[ms]
 
     #allows to select specific columns to save memory/time
     datafile_subset = pandas.read_parquet(testfile, columns=['embeddings'])
@@ -433,6 +467,15 @@ def initialization():
             startind = random.randint(0,len(datafile_subset['embeddings']) - NUM_ROWS - 1)
             stockdata = datafile_subset['embeddings'][startind:startind + NUM_ROWS]
             print("Block used: [" + str(startind) + ":" + str(startind+NUM_ROWS) + "], #Vector embeddings calculated: " + str(NUM_ROWS))
+        elif(DATA_SELECTION_MODE == 3):
+            if(RAND_BLOCK == True):
+                startind = random.randint(0,len(datafile_subset['embeddings']) - NUM_ROWS - 1)
+                stockdata = datafile_subset['embeddings'][startind:startind + NUM_ROWS]
+                print("Block used: [" + str(startind) + ":" + str(startind+NUM_ROWS) + "], #Vector embeddings calculated: " + str(NUM_ROWS))
+            elif(RAND_BLOCK == False):
+                global START_IND
+                stockdata = datafile_subset['embeddings'][START_IND:START_IND + NUM_ROWS + 1]
+                print("Block used: [" + str(START_IND) + ":" + str(START_IND+NUM_ROWS-1) + "], #Vector embeddings calculated: " + str(NUM_ROWS))
         else:
             stockdata = datafile_subset['embeddings'][:NUM_ROWS]
         
@@ -674,9 +717,18 @@ def initialization():
 
 if __name__ == '__main__':
     initialization()
+    #To do for next revisions monday 2/2/26 and later:
+    # - You also need to standardize the ratios a bit so you can compare them more easily
+    #You generally need to add your new ease-of-use features from your FineWebEDU code:
+    # - Local and online streaming/scanning
+    # - Manual and random selection of these files
+    # - local file overhaul to work on more machines
+    
+    
     #STARTING GUIDE:
     # - There are settings and parameters at the top of this code file for you to tweak
-    # - First thing I would recommend is change file paths, adjust the code files you want to access
+    # - [new] I added file directory scanning so it makes it easier to work on other machines
+    # - [new] I couldn't add online file streaming due to security on legacy repositories, so you still have to manually download the vector embedding files (.parquet)
     
     #Sorry that the code is so messy, it was worse before, but it could be a lot better
     
