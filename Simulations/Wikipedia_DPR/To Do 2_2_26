@@ -1,0 +1,6 @@
+To Do 2/2/26: (for V1.3)
+- Implement symmetric scalar quantization before bitplane compression (FP32 --> INT8 + Scalar) [Scalar must have granularity per bit plane for both single and multivector]
+- Implement 4kb LZ4 and ZSTD compression per bit plane and get its compression ratios for each embedding's bitplanes and scalars
+
+new ideas: (for V1.3)
+- add options to do scalar compression across 32 bit planes or across 768 rows
