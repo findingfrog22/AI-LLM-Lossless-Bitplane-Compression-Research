@@ -18,6 +18,19 @@ Performance and Implementation Details:
 - --> Technically supports other GPU frameworks like CUDA and ROCm, but isn't tested, so use at your own risk
 - --> CPU mainly performs data conversion/transformation operations in a pool of multiple threads, processes GPU output in a Python and user readable format
 - File Selection (newer versions)
-- --> Gives options for locally scanned files or online streaming*
+- --> Gives options for locally scanned files or online streaming*[1]
+- Many libraries were used:
+- --> pytorch 2.9.1+xpu *[2]
+- --> numpy
+- --> multiprocessing + Pool
+- --> pandas
+- --> random
+- --> pathlib + Path
+- --> sys
+- --> struct
+- --> time
+- --> lz4.frame
+- --> zstandard
 
-*online streaming isn't available for Wikipedia DPR dataset due to being a legacy database
+*[1] online streaming isn't available for Wikipedia DPR dataset due to being a legacy database
+*[2] anything older than pytorch 2.9.1+xpu for intel arc will need the intel extension library IPEX
