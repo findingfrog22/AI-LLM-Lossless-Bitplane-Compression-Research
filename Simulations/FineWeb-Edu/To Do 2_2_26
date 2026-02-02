@@ -1,0 +1,8 @@
+To Do 2_2_26: (for V0.2)
+- Make it utilize and pull .npy embedding files rather than .parquet files
+
+for V0.3:
+- start symmetric scalar quantization
+
+for V0.4:
+- bitplane disaggregation for vertical multivector and horizontal single-vector embeddings
