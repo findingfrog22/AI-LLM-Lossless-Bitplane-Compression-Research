@@ -1,0 +1,3 @@
+To Do 2/8+/26: (for A0.9.0)
+- Implement 4kb LZ4 and ZSTD compression per bit plane and get its compression ratios for each embedding's bitplanes and scalars
+- Put in prints that explain results
