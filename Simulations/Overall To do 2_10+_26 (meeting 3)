@@ -1,0 +1,15 @@
+Our next task is to work on the overall simulation, we need code that can handle vector embeddings and data from different file types, sources, and formats
+To do 2_10+_26:
+- Create parsing code that can handle different data types (.parquet, .npy, .jsonL, .json, .idx, etc)
+- get them into a standard format
+- controllable mixed precision
+
+From meeting 3:
+- 1. add direct compression of 4KB block size (and/or controllable block size)
+- 2. perform symmetric scalar quantization (with controllable block size and precision)
+- 3. try rearrangement techniques and bitplane compression stuff (vertical, horizontal, LZ4, ZSTD, RLE)
+- 4. ?? bitstring --> lossless compression
+
+General goals for this:
+- Abstract your code away to handle controllable parameters like datatypes and precision, make it more "universal" and simpler.
+- Maybe use different files and call to them
