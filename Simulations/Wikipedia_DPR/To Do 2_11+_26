@@ -1,0 +1,15 @@
+To Do 2/11+/26: (for A0.9.0)
+- Implement 4kb LZ4 and ZSTD compression per bit plane
+- add print titles above each LZ4 and ZSTD result table to explain what it is the result of (vertical, horizontal, quant, scale, single, multi, etc)
+- add average analytics to the LZ4 and ZSTD Compression
+- add explanations under each result to explain how to interpret results
+- clean up code
+- remove debug print statements
+
+Note: this may be on hiatus for a bit as I focus on my next task. I want to make some code that universally handles embedding files from different data types, then integrate it into this simulation
+
+Nice to haves to implement during beta:
+- randomization features
+- file scanning + selection
+- control over block sizes
+- direct compression of blocks (LZ4, ZSTD)
