@@ -2,7 +2,8 @@
 WikipediaDPR_path = "C:/Users/findi/OneDrive/Desktop/AI Research Datasets/Wikipedia DPR Mini/" #base directory of Wikipedia DPR mini dataset
 testfile = WikipediaDPR_path + "Multiset/train-00000-of-00157.parquet" #current file selection
 
-NUM_ROWS = 512 #this is how many rows of vector embeddings will be processed
+NUM_ROWS = 1 #this is how many rows of vector embeddings will be processed
+#Note about NUM_ROWS: for LZ4 and ZSTD compression analysis, make sure this number is divisible by 8 (for multivectors)
 NUM_DIMS = 768 #this is the number of weights per vector embedding
 
 #some more global settings
@@ -16,7 +17,7 @@ PRINT_DEBUG = False #determines if you want to print information relevant for de
 # [True] on
 
 #symmetric scalar quantization settings
-MULTI_SCALAR = True
+MULTI_SCALAR = False
 #MULTI_SCALAR determines if you want to do symmetric scalar quantization on your columns of vector embeddings
 # --> note that this only works if your NUM_ROWS > 1 (allows for vertical bit plane disaggregation)
 # True - [Multiscalar on]
@@ -214,6 +215,252 @@ def quantization_histogram(quant, mode):
     plt.grid(axis='y', linestyle='--', alpha=0.6)
     plt.savefig('quantized_distribution[' + mode + '].png')
 
+#now on to LZ4 and ZSTD [THIS IS FOR MONDAY 2/9/26 AND LATER BTW, PLANNING STAGE AND IMPLEMENTATION DETAILS]
+#There are 2-3 different analysis techniques
+#1.) [vertical compression] "sliced" compression, where we get entire 2D bitplanes 768 tall x #rows deep per bitplane and perform LZ4/ZSTD on each of these (Vertical compression)
+# --> tells how compressible entire bitplanes (of all vector dims and rows) are
+#2.) [depth compression] "tiled" compression, where we get the compressibility of each 1 x #rows deep per bitplane per dim of vector embedding, results in 2d plane of compressibility for each bitplane for each vector dim (Depth compression)
+# --> tells how compressible bitplanes per vector dim are (across all rows)
+#3.) [optional, topological compression] performs compressibility of each bitplane for the entire vector dim, takes each 1x768 [0] of each and compresses it
+# --> tells how compressible each row's bitplanes are (across all vector embedding dims)
+#now ideally, we should probably make them compatible with quantized, scales, horizontal, and vertical, lets think about the logistics of this
+# - Quantized (vertical and horizontal) (768 tall, 8 wide, #rows deep)
+# --> Vertical: output --> (1 tall, 8 wide)
+# --> Depth: output --> (768 tall, 8 wide)
+# --> Topological: output --> (1 tall, 8 wide, #rows deep)
+# - Scales (vertical) [per dim] (32 tall, 1 wide, 768 deep)
+# --> Vertical: output --> (not really possible)
+# --> Depth: output --> (32 tall, 1 wide) [need custom implementation]
+# --> Topological: output --> (not really possible)
+# - Scales (horizontal) [per vector embedding] (32 tall, 1 wide, #rows deep)
+# --> Vertical: output --> (not really possible)
+# --> Depth: output --> (32 tall, 1 wide) [semi custom impelementation, same as scales vertical depth]
+# --> Topological: output --> (not really possible)
+# now for single vector embedding input:
+# - Quantized: horizontal only (768 tall, 8 wide) # note that vertical and topological are the same thing for this one
+# --> Vertical: output --> (1 tall, 8 wide)
+# --> Depth: output --> (very useless)
+# --> Topological: output --> (1 tall, 8 wide)
+# Scales (vertical) [per dim] (not possible)
+# --> Vertical: output --> (not possible)
+# --> Depth: output --> (not possible)
+# --> Topological: output --> (not possible)
+# Scales (horizontal) [per vector embedding] (not possible)
+# --> Vertical: output --> (not possible)
+# --> Depth: output --> (not possible)
+# --> Topological: output --> (not possible)
+# so Scale for Single vector embedding is a simple LZ4/ZSTD Compression analysis value
+
+#2-3 more vibe coded functions, be careful
+
+def lz4_compress_list(data_list):
+    import lz4.frame
+    return sum(len(lz4.frame.compress(a, block_size=BLOCK_SIZE)) for a in data_list)
+
+def zstd_compress_list(data_list):
+    import zstandard as zstd
+    """Compresses a list of byte-buffers and returns the total compressed size."""
+    c = zstd.ZstdCompressor(level=3)
+    return sum(len(c.compress(b)) for b in data_list)
+
+def run_phased_benchmark(tensor_d): #results: < 1 is good
+    import torch
+    import multiprocessing as mp
+    import zstandard as zstd
+    import pandas as pd
+    D, B, N = tensor_d.shape
+    # 1. PACKING PHASE (XPU)
+    # Collapse N (depth) into N//8 bytes
+    tensor_dbn = torch.from_numpy(tensor_d).to(ACCELERATION_DEVICE)
+    reshaped = tensor_dbn.view(D, B, N // 8, 8).to(torch.uint8)
+    packed = (reshaped[..., 0] << 7) | (reshaped[..., 1] << 6) | \
+             (reshaped[..., 2] << 5) | (reshaped[..., 3] << 4) | \
+             (reshaped[..., 4] << 3) | (reshaped[..., 5] << 2) | \
+             (reshaped[..., 6] << 1) | (reshaped[..., 7] << 0)
+    
+    # Move to CPU: Shape (Bitplane=8, Dim=768, Packed_Depth=N/8)
+    brick = packed.permute(1, 0, 2).cpu().numpy()
+    original_size_kb = (D * N / 8) / 1024
+    results = {k: {"Bitplane": k} for k in range(8)}
+
+    with mp.Pool(processes=8) as pool:
+        # --- PHASE 1: GLOBAL WALL (8 planes in parallel) ---
+        print("Running Global Wall Analysis...")
+        global_buffers = [brick[k].tobytes() for k in range(8)]
+        # Using a simple list comprehension for global since it's just 8 tasks
+        g_sizes = pool.map(zstd_compress_list, [[b] for b in global_buffers])
+        for k, size in enumerate(g_sizes):
+            results[k]["Global(ZSTD)"] = round((size / 1024) / original_size_kb, 3)
+        g4_sizes = pool.map(lz4_compress_list, [[b] for b in global_buffers])
+        for k, size in enumerate(g4_sizes):
+            results[k]["Global(LZ4)"] = round((size / 1024) / original_size_kb, 3)
+
+        # --- PHASE 2: TEMPORAL FIBRES (8 planes in parallel) ---
+        print("Running Temporal Fibre Analysis...")
+        # We prepare a list of lists: 8 bitplanes, each containing 768 strings
+        temporal_tasks = [[brick[k, i].tobytes() for i in range(D)] for k in range(8)]
+        t_sizes = pool.map(zstd_compress_list, temporal_tasks)
+        for k, size in enumerate(t_sizes):
+            results[k]["Temporal(ZSTD)"] = round((size / 1024) / original_size_kb, 3)
+        t4_sizes = pool.map(lz4_compress_list, temporal_tasks)
+        for k, size in enumerate(t4_sizes):
+            results[k]["Temporal(LZ4)"] = round((size / 1024) / original_size_kb, 3)
+
+        # --- PHASE 3: SPATIAL COLUMNS (8 planes in parallel) ---
+        print("Running Spatial Column Analysis...")
+        # We prepare a list of lists: 8 bitplanes, each containing N/8 strings
+        spatial_tasks = [[brick[k, :, j].tobytes() for j in range(N // 8)] for k in range(8)]
+        s_sizes = pool.map(zstd_compress_list, spatial_tasks)
+        for k, size in enumerate(s_sizes):
+            results[k]["Spatial(ZSTD)"] = round((size / 1024) / original_size_kb, 3)
+        s4_sizes = pool.map(lz4_compress_list, spatial_tasks)
+        for k, size in enumerate(s4_sizes):
+            results[k]["Spatial(LZ4)"] = round((size / 1024) / original_size_kb, 3)
+
+    # Final Table
+    df = pd.DataFrame(list(results.values())).sort_values("Bitplane", ascending=False)
+    print("\n" + df.to_string(index=False))
+    return df
+    #BTW:
+    # --> Global == "sliced" or "vertical"
+    # --> Temporal == "depth"
+    # --> Spatial == "topological"
+
+def vertical_scale_compression_benchmark(Scale):
+    import torch
+    import multiprocessing as mp
+    import zstandard as zstd
+    import pandas as pd
+    scale = Scale[0]
+    print(scale.shape)
+    D, B = scale.shape
+    # 1. PACKING PHASE (XPU)
+    # Collapse N (depth) into N//8 bytes
+    tensor_dbn = torch.from_numpy(scale).to(ACCELERATION_DEVICE)
+    reshaped = tensor_dbn.view(D, B // 8, 8).to(torch.uint8)
+    packed = (reshaped[..., 0] << 7) | (reshaped[..., 1] << 6) | \
+             (reshaped[..., 2] << 5) | (reshaped[..., 3] << 4) | \
+             (reshaped[..., 4] << 3) | (reshaped[..., 5] << 2) | \
+             (reshaped[..., 6] << 1) | (reshaped[..., 7] << 0)
+    #get original size
+    orig_size = (D * (B // 8)) / 1024 #in KB
+    brick = packed.cpu().numpy()
+    results = {k: {"Bitplane": k} for k in range(32)}
+    with mp.Pool(processes=8) as pool:
+        # --- PHASE 1: GLOBAL WALL (8 planes in parallel) ---
+        print("Running Global Wall Analysis...")
+        global_buffers = [brick[k].tobytes() for k in range(32)]
+        # Using a simple list comprehension for global since it's just 32 tasks
+        g_sizes = pool.map(zstd_compress_list, [[b] for b in global_buffers])
+        for k, size in enumerate(g_sizes):
+            results[k]["Scale Vertical (ZSTD)"] = round((size / 1024) / orig_size, 3)
+        g4_sizes = pool.map(lz4_compress_list, [[b] for b in global_buffers])
+        for k, size in enumerate(g4_sizes):
+            results[k]["Scale Vertical (LZ4)"] = round((size / 1024) / orig_size, 3)
+    # Final Table
+    df = pd.DataFrame(list(results.values())).sort_values("Bitplane", ascending=False)
+    print("\n" + df.to_string(index=False))
+    return df
+
+def horizontal_scale_compression_benchmark(scale):
+    import torch
+    import multiprocessing as mp
+    import zstandard as zstd
+    import pandas as pd
+    #scale = Scale[0]
+    print(scale.shape)
+    D, B = scale.shape
+    # 1. PACKING PHASE (XPU)
+    # Collapse N (depth) into N//8 bytes
+    tensor_dbn = torch.from_numpy(scale).to(ACCELERATION_DEVICE)
+    reshaped = tensor_dbn.view(D, B // 8, 8).to(torch.uint8)
+    packed = (reshaped[..., 0] << 7) | (reshaped[..., 1] << 6) | \
+             (reshaped[..., 2] << 5) | (reshaped[..., 3] << 4) | \
+             (reshaped[..., 4] << 3) | (reshaped[..., 5] << 2) | \
+             (reshaped[..., 6] << 1) | (reshaped[..., 7] << 0)
+    #get original size
+    orig_size = (D * (B // 8)) / 1024 #in KB
+    brick = packed.cpu().numpy()
+    results = {k: {"Bitplane": k} for k in range(32)}
+    with mp.Pool(processes=8) as pool:
+        # --- PHASE 1: GLOBAL WALL (8 planes in parallel) ---
+        print("Running Global Wall Analysis...")
+        global_buffers = [brick[k].tobytes() for k in range(32)]
+        # Using a simple list comprehension for global since it's just 32 tasks
+        g_sizes = pool.map(zstd_compress_list, [[b] for b in global_buffers])
+        for k, size in enumerate(g_sizes):
+            results[k]["Scale Vertical (ZSTD)"] = round((size / 1024) / orig_size, 3)
+        g4_sizes = pool.map(lz4_compress_list, [[b] for b in global_buffers])
+        for k, size in enumerate(g4_sizes):
+            results[k]["Scale Vertical (LZ4)"] = round((size / 1024) / orig_size, 3)
+    # Final Table
+    df = pd.DataFrame(list(results.values())).sort_values("Bitplane", ascending=False)
+    print("\n" + df.to_string(index=False))
+    return df
+
+def single_embedding_run_phased_benchmark(tensor_d): #results: < 1 is good
+    import torch
+    import multiprocessing as mp
+    import zstandard as zstd
+    import pandas as pd
+    D, B = tensor_d.shape
+    print("\nDEBUG: TENSOR SHAPE: ")
+    print(tensor_d.shape)
+    # 1. PACKING PHASE (XPU)
+    # Collapse N (depth) into N//8 bytes
+    #tensor_dbn = torch.from_numpy(tensor_d).to(ACCELERATION_DEVICE)
+    reshaped = tensor_d.view(D, B // 8, 8).to(torch.uint8)
+    packed = (reshaped[..., 0] << 7) | (reshaped[..., 1] << 6) | \
+             (reshaped[..., 2] << 5) | (reshaped[..., 3] << 4) | \
+             (reshaped[..., 4] << 3) | (reshaped[..., 5] << 2) | \
+             (reshaped[..., 6] << 1) | (reshaped[..., 7] << 0)
+    
+    # Move to CPU: Shape (Bitplane=8, Dim=768, Packed_Depth=N/8)
+    #brick = packed.permute(1, 0).cpu().numpy()
+    brick = packed.cpu().numpy()
+    #D, B = brick.shape
+    #print("\nD: " + str(D))
+    #for s in brick: #notice that there is something weird here, horizontal characters have more redundancy than vertically
+        #print(s)
+    original_size_kb = (D * B / 8) / 1024
+    results = {k: {"Bitplane": k} for k in range(D)}
+
+    with mp.Pool(processes=8) as pool:
+        # --- PHASE 1: GLOBAL WALL (8 planes in parallel) ---
+        print("Running Global Wall Analysis...")
+        global_buffers = [brick[k].tobytes() for k in range(8)]
+        # Using a simple list comprehension for global since it's just 8 tasks
+        g_sizes = pool.map(zstd_compress_list, [[b] for b in global_buffers])
+        for k, size in enumerate(g_sizes):
+            results[k]["Global(ZSTD)"] = round((size / 1024) / original_size_kb, 3)
+        g4_sizes = pool.map(lz4_compress_list, [[b] for b in global_buffers])
+        for k, size in enumerate(g4_sizes):
+            results[k]["Global(LZ4)"] = round((size / 1024) / original_size_kb, 3)
+
+    # Final Table
+    df = pd.DataFrame(list(results.values())).sort_values("Bitplane", ascending=False)
+    print("\n" + df.to_string(index=False)) #confirmed correct results
+    return df
+    #BTW:
+    # --> Global == "sliced" or "vertical"
+    # --> Temporal == "depth"
+    # --> Spatial == "topological"
+    
+def single_scale_compression(Scale): # < 1 good
+    import torch
+    import multiprocessing as mp
+    import zstandard as zstd
+    import lz4.frame
+    import pandas as pd
+    import numpy
+    scale = Scale[0][0]
+    dat = str(scale)
+    bat = int(dat, 2)
+    raw_data = bat.to_bytes(4, byteorder='big')
+    zstd_compression = zstd.ZstdCompressor(level=3).compress(raw_data)
+    lz4_compression = lz4.frame.compress(raw_data, store_size=False)
+    print("\nSingle Scale Compression: \nOriginal Size: " + str(len(raw_data)) + " bytes\nZSTD Ratio: " + str(len(zstd_compression) / len(raw_data)) + "\nLZ4 Ratio: " + str(len(lz4_compression) / len(raw_data)))
+
 #lets keep this simulation simpler and more focused on given priorities
 #What we need:
 # - Perform symmetric scalar quantization for raw embedding FP32 --> INT8 + scalar (for begginning, use single vector embedding dim=768 as granularity for calculating scale)
@@ -338,10 +585,16 @@ def initialization():
         #binstring_qr
         #first, the quantized data
         vector_embedding_qr = binstring_qr[0]
+        print("\nDEBUG: binstring_qr: ")
+        print(numpy.asarray(vector_embedding_qr))
+        print(numpy.asarray(vector_embedding_qr).shape)
         binsplit_qr = Pool().map(binarytolist, vector_embedding_qr)
         if(PRINT_DEBUG == True):
             print("\nDEBUG: binsplit_qr: ")
             print(numpy.array(binsplit_qr))#works
+        print("\nDEBUG: binsplit_qr: ")
+        print(numpy.asarray(binsplit_qr))
+        print(numpy.asarray(binsplit_qr).shape)
         
         #now we need to transpose the matrix
         Matrix_qr = torch.tensor(binsplit_qr)
@@ -351,6 +604,9 @@ def initialization():
             print("\nDEBUG: bitplanes_qr: ")
             print(bitplanes_qr)
         #print(bitplanes_qr.to("cpu"))#works
+        print("\nDEBUG: bitplanes_qr: ")
+        print(bitplanes_qr)
+        print(bitplanes_qr.shape)
         
         #now analyze the compressibility of the bitplanes
         print("\n[single horizontal quant, quant] HORIZONTAL BITPLANE COMPRESSION (Single plane) (-->0 good): ")
@@ -361,12 +617,22 @@ def initialization():
         avg_sr = torch.mean(comp_qr)
         print(avg_sr)
         
+        #test
+        single_embedding_run_phased_benchmark(bitplanes_qr)
+        #
+        
         #now, the scale data
         vector_embedding_sr = binstring_sr
         binsplit_sr = Pool().map(binarytolist, vector_embedding_sr)
         if(PRINT_DEBUG == True):
             print("\nDEBUG: binsplit_sr: ")
             print(binsplit_sr)#works
+        print("\nDEBUG: binsplit_sr: ")
+        print(binsplit_sr)
+        
+        #test
+        single_scale_compression(binsplit_sr)
+        #
         
         #since the scale only has 1 value, we cannot decompose it into bitplanes for compression analysis
         '''
@@ -386,20 +652,33 @@ def initialization():
         #binstring_sc
         #binstring_qc
         #first, try it with quantized data (row-wise)
+        print("\nDEBUG: binstring_qr: ")
+        print(numpy.asarray(binstring_qr))
+        print(numpy.asarray(binstring_qr).shape)
         binsplit_qr = Pool().map(binaryvectortolist, binstring_qr)
         if(PRINT_DEBUG == True):
             print("\nDEBUG: binsplit_qr: ")
             print(binsplit_qr)
+        print("\nDEBUG: binsplit_qr: ")
+        print(numpy.asarray(binsplit_qr))
+        print(numpy.asarray(binsplit_qr).shape)
     
         #then transpose time
         matrix_qr = numpy.stack(binsplit_qr, axis=-1)
         if(PRINT_DEBUG == True):
             print("\nDEBUG: matrix_qr: ")
             print(matrix_qr)
+        print("\nDEBUG: matrix_qr: ")
+        print(matrix_qr)
+        print(matrix_qr.shape)
         
         comp_qr = vertical_bitplane_compressibility(matrix_qr, NUM_DIMS)
         print("\n[horizontal quant, quant] MULTI VECTOR VERTICAL BIT PLANE COMPRESSION RATIOS [Run Length Encoding](-->0 good): ")
         print(comp_qr)
+        
+        #for now, test
+        run_phased_benchmark(matrix_qr)
+        #
         
         print("\n[horizontal quant, quant] AVERAGE COMPRESSION RATIOS PER BIT PLANE: ")
         avg_qr = torch.mean(comp_qr, dim=0)
@@ -434,6 +713,10 @@ def initialization():
         avg_sr = torch.mean(comp_sr)
         print(avg_sr)
         
+        #for now, test
+        vertical_scale_compression_benchmark(matrix_sr)
+        #
+        
         #now we also need to account for vertical symmetric quantization too
         if(MULTI_SCALAR == True):
             #first, try it with quantized data (col-wise)
@@ -463,6 +746,10 @@ def initialization():
             print("\n[vertical quant, quant] AVG COMPRESSION RATIO TOTAL BLOCK: ")
             avg3_qc = torch.mean(avg_qc, dim=0)
             print(avg3_qc)
+            
+            #try this
+            run_phased_benchmark(matrix_qc)
+            #
         
             #then try it with scales (row-wise)
             binsplit_sc = Pool().map(binaryvectortolist, binstring_sc)
@@ -485,6 +772,9 @@ def initialization():
             
             print("\n[vertical quant, scale] AVERAGE COMPRESSIBILITY BETWEEN ALL COMPRESSION RATIOS [RLE]: ")
             print(torch.mean(comp_sc))
+            
+            #test it
+            horizontal_scale_compression_benchmark(matrix_sc)
             pass
         pass
     pass
@@ -494,7 +784,9 @@ if __name__ == '__main__':
     initialization()
     #TO DO LIST FOR 2/8/26+:
     # - I already checked the correctness of (multiscalar stuff for the most part, and some other main stuff), but make sure the rest is correct?
-    # - once that is ironed out, we make versions of the compressibility analytics that use LZ4 and ZSTD per row,column, etc (with block sizes being customizable)
+    # - You implemented compression analytics for ZSTD and LZ4, you did analyze correctness and didnt see anything out of the ordinary (is it okay??)
+    # - Add print info for what the analytics are (LZ4 and ZSTD) for each quant, scale, vertical, horizontal, etc
+    # - Remove debug print statements, and clean up code a bit
     # - add print information under each results to explain how to interpret the results
     # - work on developing the other steps
     
