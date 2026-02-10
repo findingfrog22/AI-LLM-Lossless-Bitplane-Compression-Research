@@ -1,0 +1,7 @@
+To Do 2/10+/26: (for A0.9.0)
+- Implement 4kb LZ4 and ZSTD compression per bit plane
+- add print titles above each LZ4 and ZSTD result table to explain what it is the result of (vertical, horizontal, quant, scale, single, multi, etc)
+- add average analytics to the LZ4 and ZSTD Compression
+- add explanations under each result to explain how to interpret results
+- clean up code
+- remove debug print statements
