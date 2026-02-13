@@ -4,6 +4,12 @@ To do 2_10+_26:
 - get them into a standard format
 - controllable mixed precision
 
+To do specifically for 2_13_26: (A0.5)
+- Set all scalars to FP32 (Rui wants that)
+- Finish binary string conversions
+- Try to finish binary string --> bitplane conversions (int --> uint etc, try to abstract them to functions if possible)
+- maybe clean up code and comments? (some prints should probably be commented out for now)
+
 From meeting 3:
 - 1. add direct compression of 4KB block size (and/or controllable block size)
 - 2. perform symmetric scalar quantization (with controllable block size and precision)
