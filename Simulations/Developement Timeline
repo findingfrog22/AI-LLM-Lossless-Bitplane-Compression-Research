@@ -1,0 +1,38 @@
+Early-Alpha A0.3:
+- Added file autodetect with selection menu
+- Added basic auto-parsers that convert file data into tensors
+- Added an embedding data autodetector
+
+Mid-Alpha A0.4:
+- Autodetect of quantization type, scalar type, input tensor type
+- Tested support for .npy and .parquet files
+- Symmetric Scalar Quantization with customizable precision (Custom Quantized Precision, autodetected scalar precision)(row-wise and column-wise)
+- Dequantization (autodetect)
+- Mean Square Error Quantization Analysis (multiple metrics, element-wise, vector-wise, dimension-wise, etc)
+- Histogram .png generation for Quantized Values (files, not printed in terminal)
+
+A0.5 late alpha - Binary Bit plane conversion: [porting features from previous simulation code]
+- Binary string conversion
+- Multiple Bitplane Disaggregation techniques (vertical, horizontal)
+- Set Scalars to FP32 manually
+
+Early Beta B0.7 - Compression Analysis: (porting features from previous simulation code)
+- Quantized Compression Analysis (Horizontal, Vertical) [RLE, LZ4, ZSTD - Global, Temporal, Spatial]
+- Shannon Entropy Analysis
+- Controllable block size (parameters)
+- Direct File Compression analysis (for comparison)
+- Comparison of Quantized compression analysis to Non-quantized compression analysis
+- more averaged results for more direct comparisons
+
+Late Beta B0.9 - Finishing Touches: 
+- File Randomization settings, 
+- Row Selection Settings, 
+- Better print formatting and explanations
+
+Early Release V1.0 - Adding and testing for more filetypes:
+- Added support for .csv
+- Added support for .db
+- added support for .jsonl
+
+...and the future is TBD
+
