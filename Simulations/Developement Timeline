@@ -34,5 +34,9 @@ Early Release V1.0 - Adding and testing for more filetypes:
 - Added support for .db
 - added support for .jsonl
 
+Release V1.1 - Adding Support for Nvidia CUDA
+
+Release V1.2 - Adding Support for AMD ROCm
+
 ...and the future is TBD
 
