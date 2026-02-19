@@ -5,7 +5,7 @@ import os
 base_directory = os.path.dirname(os.path.abspath(__file__))
 import torch
 file_path = ""
-NUM_ROWS = 2048
+NUM_ROWS = 512
 NUM_DIMS = 768 #768 is default, but will automatically change with shape recognition
 MAX_ROWS = 10000 #10k is default, but will automatically change with shape recognition
 
@@ -22,7 +22,7 @@ ACCELERATION_DEVICE = "xpu"
 
 #debug settings
 PRINT_DEBUG = False
-SHOW_EXTRANEOUS_RESULTS = False #default false to improve performance
+SHOW_EXTRANEOUS_RESULTS = True #default false to improve performance
 
 #don't worry about these
 qmat = 0
@@ -490,9 +490,102 @@ def pmark(tensor_d):
     D, B, N = tensor_d.shape
     pass
 
+#vibe coded pack_bits, modify and customize and verify it
+def pack_bits(tensor_r, dim): #NOTE: both of these modes are confirmed correct and working. Keep in mind it does 0 padding for N and/or B if they aren't a multiple of 8, which might inflate compression ratios, but this is done to some degree on real devices anyways
+    """
+    Packs a binary tensor (0, 1) into uint8 bytes along the N (0) or B (2) dimension.
+    Input Shape: (N, W, B)
+    """
+    import torch
+    # 0. Make sure the input is a tensor, turn it to tensor if it is a numpy array
+    if(torch.is_tensor(tensor_r) == False):
+        tensor_s = torch.tensor(tensor_r)
+    else:
+        tensor_s = tensor_r
+    tensor_s = tensor_s.to(ACCELERATION_DEVICE)
+    
+    if(dim == 0): #packed_n (for spatial)
+        N, W, B = tensor_s.shape
+        remainder = N % 8
+        if remainder != 0:
+            pad_amt = 8 - remainder
+            # Pad the first dimension (N). F.pad uses (left, right, top, bottom, front, back)
+            # For 3D (N, W, B), the order is (B_front, B_back, W_front, W_back, N_front, N_back)
+            tensor_s = torch.nn.functional.pad(tensor_s, (0, 0, 0, 0, 0, pad_amt))
+        # Reshape to (N_padded//8, 8, W, B)
+        padded_N = tensor_s.shape[0]
+        reshaped = tensor_s.reshape(padded_N // 8, 8, W, B)
+        # Permute to move the '8' to the end: (N//8, W, B, 8)
+        reshaped = reshaped.permute(0, 2, 3, 1)
+        
+        weights = torch.tensor([128, 64, 32, 16, 8, 4, 2, 1], device=ACCELERATION_DEVICE, dtype=torch.uint8)
+        packed = (reshaped.to(torch.uint8) * weights).sum(dim=-1).to(torch.uint8)
+        
+        return packed
+    
+    elif(dim == 2): #packed_b (for global and temporal)
+        # 1. Safely move the dimension you want to pack to the end
+        # Works for (N, W, B) or even (Batch, N, W, B)
+        # If dim=0 (N), shape becomes (W, B, N)
+        # If dim=2 (B), shape stays (N, W, B)
+        tensor = torch.movedim(tensor_s, dim, -1)
+        orig_shape = list(tensor_r.shape)
+        target_size = orig_shape[-1]
+
+        # 2. Padding (Crucial to avoid Shape Errors)
+        remainder = target_size % 8
+        if remainder != 0:
+            pad_size = 8 - remainder
+            # Padding only the last dimension (which is our target dim)
+            tensor = torch.nn.functional.pad(tensor, (0, pad_size), "constant", 0)
+            orig_shape[-1] += pad_size # Update shape for the reshape
+
+        # 3. Reshape: Isolate groups of 8 bits
+        # Shape becomes (..., Target_Size // 8, 8)
+        reshaped = tensor.reshape(*orig_shape[:-1], -1, 8)
+
+        # 4. Bit-weighting Math
+        # We use powers of 2 (128, 64, 32, 16, 8, 4, 2, 1)
+        weights = torch.tensor([128, 64, 32, 16, 8, 4, 2, 1], 
+                               device=ACCELERATION_DEVICE, dtype=torch.uint8)
+    
+        # Multiply and sum to create the byte (0-255)
+        packed = (reshaped.to(torch.uint8) * weights).sum(dim=-1).to(torch.uint8)
+
+        # 5. Move it back to where it started
+        # (W, B, N/8) -> (N/8, W, B)  OR  (N, W, B/8)
+        packed = torch.movedim(packed, -1, dim)
+    
+        return packed
+    else:
+        raise ValueError("Dimension for pack_bits must be either 0 or 2...")
+
+# Example for your (N, W, B) tensor:
+# packed_N = pack_bits(tensor, dim=0) # Packs rows into bytes
+# packed_B = pack_bits(tensor, dim=2) # Packs bitplanes into bytes
+
 #vibe modded version of previous code, modify it further
 def run_phased_benchmark(tensor_d, form, variant):
-    #just a dummy function for now
+    import torch
+    import multiprocessing
+    import zstandard as zstd
+    import pandas as pd
+    
+    #First, get the dimensions/shape of the incoming tensor
+    N, W, B = tensor_d.shape
+    #where:
+    # - N = height (typically the number of rows)
+    # - W = width (typically dim of vector embedding)
+    # - B = depth (typically the length of bitplane or number of bits in msb)
+    
+    #print("\nDEBUG: packed input tensor: " + str(tensor_d.shape) + " [Original Bitplanes]: ")
+    #print(tensor_d)
+    packed_n = pack_bits(tensor_d, dim=0)#for spatial
+    print("\nDEBUG: packed_n tensor: " + str(packed_n.shape) + " [for Spatial]: ")
+    print(packed_n)
+    packed_b = pack_bits(tensor_d, dim=2) #for global and temporal
+    print("\nDEBUG: packed_b tensor: " + str(packed_b.shape) + " [for Global and Temporal]: ")
+    print(packed_b)
     pass
 
 def run_phased_benchmark0(tensor_d, form, variant):
@@ -517,13 +610,14 @@ def run_phased_benchmark0(tensor_d, form, variant):
     
     # NEW: Pack D into bytes for Spatial analysis (to measure feature correlation)
     # We permute so D is at the end, then pack D into D//8
-    reshaped_d = tensor_dbn.permute(2, 1, 0).reshape(N, B, D // 8, 8).to(torch.int64)
+    reshaped_d = tensor_dbn.permute(2, 1, 0).reshape(N, B, (D // 8)+(D % 8), 8).to(torch.int64)
     packed_d = (reshaped_d[..., 0] << 7) | (reshaped_d[..., 1] << 6) | \
                (reshaped_d[..., 2] << 5) | (reshaped_d[..., 3] << 4) | \
                (reshaped_d[..., 4] << 3) | (reshaped_d[..., 5] << 2) | \
                (reshaped_d[..., 6] << 1) | (reshaped_d[..., 7] << 0)
 
-    # Move to CPU and fix orientation
+    # Move to CPU and fix orientation [N, W, B]
+    #n: (N,W,B//8) --> 
     # brick_n: (D, B, N//8) -> we want (B, D, N//8) for your loops
     brick_n = packed_n.permute(1, 0, 2).to(torch.uint8).cpu().numpy()
     # brick_d: (N, B, D//8) -> we want (B, N, D//8)
@@ -869,9 +963,10 @@ def initialization():
     
 if __name__ == '__main__':
     initialization() #call it
-    #to do 2/18+/26:
+    #to do 2/20+/26:
+    # - Highest priority: Port your LZ4+ZSTD simulation code that is already here with the pack_bits function //
+    # //so you can start actually doing analysis
     # - Check the accuracy of this simulation vs previous simulation (and check if formatting and conversions and bitplane stuff is correct)
-    # - Finish LZ4+ZSTD Global, Temporal, and Spatial Code (has some issues right now)
     #Some of the lower priority tasks:
     # - adding explantions
     # - custom block sizes for compression
