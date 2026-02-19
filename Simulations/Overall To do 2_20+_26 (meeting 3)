@@ -1,7 +1,8 @@
 Our next task is to work on the overall simulation, we need code that can handle vector embeddings and data from different file types, sources, and formats
-to do 2/18+/26: (B0.7.1)
-- Check the accuracy of this simulation vs previous simulation (and check if formatting and conversions and bitplane stuff is correct)
-- Finish LZ4+ZSTD Global, Temporal, and Spatial Code (has some issues right now)
+to do 2/20+/26: (B0.7.3)
+- Highest Priority: Finish LZ4+ZSTD Global, Temporal, and Spatial Code (port pack_bits function to the bitpacking phase of your code)
+- Check the accuracy of this simulation vs previous simulation (bitplaning and binstring conversion) (and check if formatting and conversions and bitplane stuff is correct)
+
 Some of the lower priority tasks:
 - adding explantions
 - custom block sizes for compression
