@@ -340,7 +340,58 @@ def direct_bitplane(matr): #this is for non-quantized bitplanes, returns a pair,
     #now return the values
     return bitplane_h, bitplane_v
 
-def bitplane(quant, scale, direc): #converts it into a binstring first, then converts it to bitplanes
+#vibe coded, modify and make sure it is robust
+def bitplane(quant, scale, direc): #FIXED
+    import torch
+
+    def get_planes(tensor, num_bits, direction):
+        # 1. Map to SIGNED type because XPU supports rshift for Int32/Int8
+        # float32 -> int32, uint8/int8 -> int8
+        if num_bits == 32:
+            view_type = torch.int32
+        elif num_bits == 8:
+            view_type = torch.int8
+        elif num_bits == 16:
+            view_type = torch.int16
+        else:
+            view_type = torch.int32 # Default fallback
+        
+        # 2. View data as signed
+        t_signed = tensor.detach().view(view_type)
+        
+        # 3. Create bit indices (Int32 is safe on XPU)
+        bits = torch.arange(num_bits - 1, -1, -1, device=tensor.device, dtype=torch.int32)
+        
+        # 4. Create the mask (1) 
+        mask = torch.tensor(1, device=tensor.device, dtype=view_type)
+
+        # 5. Extract bits
+        # Note: (x >> bits) & 1 works the same for signed/unsigned 
+        # as long as we only care about the resulting 0 or 1.
+        if direction == "horizontal":
+            # Target: (N, B, W)
+            planes = (t_signed.unsqueeze(1) >> bits.view(1, -1, 1)) & mask
+            #planes = planes.to(torch.uint8).contiguous()
+            #return planes.permute(2,0,1).contiguous()
+        elif direction == "vertical":
+            # Target: (B, N, W)
+            planes = (t_signed.unsqueeze(0) >> bits.view(-1, 1, 1)) & mask
+            planes = planes.to(torch.uint8).contiguous()
+            return planes.permute(2,0,1).contiguous() #now returns in form (W,B,N)
+        
+        # 6. Convert to uint8 (0 or 1) for your RLE and packing analysis
+        return planes.to(torch.uint8).contiguous()
+
+    # Determine bit depth
+    q_bits = quant.element_size() * 8
+    s_bits = scale.element_size() * 8
+    
+    q_planes = get_planes(quant, q_bits, direc)
+    s_planes = get_planes(scale, s_bits, direc)
+
+    return q_planes, s_planes
+
+def bitplane2(quant, scale, direc): #converts it into a binstring first, then converts it to bitplanes
     import torch
     from multiprocessing import Pool
     global QUANTIZATION_TYPE
@@ -435,10 +486,10 @@ def RLE_bitplane_compressibility(matrix, form, title):
     print(ratio)
     #return ratio?
     if(form == "horizontal"):
-        bp_avg = torch.mean(ratio, dim=1) #per bitplane
+        bp_avg = torch.mean(ratio, dim=0) #per bitplane, originally dim=1
         print("\nHorizontal Per Bitplane: ")
         print(bp_avg)
-        row_avg = torch.mean(ratio, dim=0) #per vector embedding
+        row_avg = torch.mean(ratio, dim=1) #per vector embedding, originally dim=0
         print("\nHorizontal Per Vector Embedding: ")
         print(row_avg)
     elif(form == "vertical"):
@@ -474,13 +525,17 @@ def calculate_overall_RLE_ratio(quant, scale, quant_ratio, scale_ratio):
 
 def lz4_compress_list(data_list):
     import lz4.frame
-    return sum(len(lz4.frame.compress(a, block_size=BLOCK_SIZE)) for a in data_list)
+    group = b"".join(data_list)
+    return len(lz4.frame.compress(group, block_size=BLOCK_SIZE))
+    #return sum(len(lz4.frame.compress(a, block_size=BLOCK_SIZE)) for a in data_list)
 
 def zstd_compress_list(data_list):
     import zstandard as zstd
     """Compresses a list of byte-buffers and returns the total compressed size."""
+    group = b"".join(data_list)
     c = zstd.ZstdCompressor(level=3)
-    return sum(len(c.compress(b)) for b in data_list)
+    return len(c.compress(group))
+    #return sum(len(c.compress(b)) for b in data_list)
 
 def pmark(tensor_d):
     import torch
@@ -557,6 +612,35 @@ def pack_bits(tensor_r, dim): #NOTE: both of these modes are confirmed correct a
         packed = torch.movedim(packed, -1, dim)
     
         return packed
+    elif(dim == 1): #packed_w, purely optional and more for experimental and curiosity purposes
+        # 1. Padding Logic (Left Pad)
+        W = tensor_s.shape[1]
+        remainder = W % 8
+        if remainder != 0:
+            pad_size = 8 - remainder
+            # F.pad for (N, W, B) to pad dim 1 (W) from the left:
+            # (B_front, B_back, W_front, W_back, N_front, N_back)
+            tensor = torch.nn.functional.pad(tensor_s, (0, 0, 0, pad_size, 0, 0), "constant", 0)
+        else:
+            tensor = tensor_s
+
+        # 2. Reshape: Split W into (W//8, 8)
+        # Shape: (N, W_padded // 8, 8, B)
+        padded_W = tensor.shape[1]
+        reshaped = tensor.reshape(tensor.shape[0], padded_W // 8, 8, tensor.shape[2])
+
+        # 3. Permute: Move the '8' to the end for the dot product
+        # (N, W//8, 8, B) -> (N, W//8, B, 8)
+        reshaped = reshaped.permute(0, 1, 3, 2)
+
+        # 4. Bit-weighting Math
+        weights = torch.tensor([128, 64, 32, 16, 8, 4, 2, 1], 
+                               device=ACCELERATION_DEVICE, dtype=torch.uint8)
+    
+        # Result: (N, W//8, B)
+        packed = (reshaped.to(torch.uint8) * weights).sum(dim=-1).to(torch.uint8)
+
+        return packed
     else:
         raise ValueError("Dimension for pack_bits must be either 0 or 2...")
 
@@ -564,29 +648,196 @@ def pack_bits(tensor_r, dim): #NOTE: both of these modes are confirmed correct a
 # packed_N = pack_bits(tensor, dim=0) # Packs rows into bytes
 # packed_B = pack_bits(tensor, dim=2) # Packs bitplanes into bytes
 
+def multilayer(matrix):
+    return [x.tobytes() for x in matrix]
+
 #vibe modded version of previous code, modify it further
+#note: form is for "vertical" or "horizontal"
+#note: variant is for "quant", "scale", and "direct"
 def run_phased_benchmark(tensor_d, form, variant):
     import torch
     import multiprocessing
     import zstandard as zstd
     import pandas as pd
+    import numpy
+    import lz4.frame
+    
+    #if the original input is not a tensor, convert it to a tensor
+    if(torch.is_tensor(tensor_d) == False):
+        tensor_d = torch.from_numpy(tensor_d).to(ACCELERATION_DEVICE)
+    
+    #standardize the tensor arrangement
+    #first, we will standardize it to the bitplanes being horizontal, this is faster on CPU SIMD for LZ4+ZSTD compression
+    #standardize the tensors to the form (N, B, W), where B is number of bitplanes, while W is dim of vector, N is number of rows
+    #if(form == "vertical"):
+        #tensor_d = tensor_d.permute(2, 1, 0)
+    #elif(form == "horizontal"):
+        #tensor_d = tensor_d.permute(1, 0, 2)
     
     #First, get the dimensions/shape of the incoming tensor
-    N, W, B = tensor_d.shape
+    N, B, W = tensor_d.shape
     #where:
     # - N = height (typically the number of rows)
     # - W = width (typically dim of vector embedding)
     # - B = depth (typically the length of bitplane or number of bits in msb)
     
-    #print("\nDEBUG: packed input tensor: " + str(tensor_d.shape) + " [Original Bitplanes]: ")
-    #print(tensor_d)
+    print("\nDEBUG: packed input tensor: " + str(tensor_d.shape) + " [Original Bitplanes]: ")
+    print(tensor_d)
     packed_n = pack_bits(tensor_d, dim=0)#for spatial
     print("\nDEBUG: packed_n tensor: " + str(packed_n.shape) + " [for Spatial]: ")
     print(packed_n)
-    packed_b = pack_bits(tensor_d, dim=2) #for global and temporal
+    packed_b = pack_bits(tensor_d, dim=2) #for global and temporal [NOTE: NOW IT IS PACKED_W, it fits better]
     print("\nDEBUG: packed_b tensor: " + str(packed_b.shape) + " [for Global and Temporal]: ")
     print(packed_b)
-    pass
+    #packed_w = pack_bits(tensor_d, dim=1) #experimental, packed_w
+    #print("\OPTIONAL DEBUG: packed_w tensor: " + str(packed_w.shape) + " [for Curiosity]: ")
+    #print(packed_w)
+    
+    '''
+    if((N>1)and(W>1)and(B>1)):
+        permute_n = packed_n.permute(0, 2, 1)
+        print("\nEXTRA: permuted_packed_n: " + str(permute_n.shape))
+        print(permute_n)
+        permute_b = packed_b.permute(0, 2, 1)
+        print("\nEXTRA: permuted_packed_b: " + str(permute_b.shape))
+        print(permute_b)
+        permute_w = packed_w.permute(0, 2, 1)
+        print("\nEXTRA: permuted_packed_w: " + str(permute_w.shape))
+        print(permute_w)
+        pass
+    '''
+    print("\nDEBUG: SHAPE OF PACKED_B: " + str(packed_b.shape))
+    B_b = packed_b.shape[1] #SO YOU NEED TO ACCOUNT FOR WHEN IT IS 1, just skip most of the compression analysis (2/21+/26)
+    print("\nDEBUG: B_b: " + str(B_b))
+    
+    #now for the LZ4+ZSTD Benchmarking
+    #first, start with preparation
+    
+    #now, we do shape and calculations
+    #N_n, B_n, W_n = packed_n.shape
+    #N_b, B_b, W_b = packed_b.shape
+    #orig_size_n_kb = (N_n * W_n) / 1024
+    orig_size_kb = (N * W) / (1024 * 8) #gets it in bytes becuase the compressors return size in bytes
+    
+    results = {k: {"Bitplane": k} for k in range(B_b)}
+    cores = min(B_b, multiprocessing.cpu_count())
+    
+    check_tensor_entropy(tensor_d)
+    
+    with multiprocessing.Pool(processes=cores) as pool:
+        #Stage 1: Global (Slices of N x W)
+        print("Stage 1: Global Analysis...")
+        b_global = packed_b.permute(1, 0, 2).contiguous().reshape(packed_b.shape[1], packed_b.shape[0] * packed_b.shape[2]).cpu().numpy()
+        print("\nDEBUG: Global shape: " + str(b_global.shape))
+        globaltasks = [[b_global[k].tobytes()] for k in range(B_b)]
+        print("\nDEBUG: Global bytes: (" + str(len(globaltasks)) + ", " + str(len(globaltasks[0])) + ", " + str(len(globaltasks[0][0])) + "): ")
+        print(globaltasks)
+        z_gsizes = pool.map(zstd_compress_list, globaltasks)
+        l_gsizes = pool.map(lz4_compress_list, globaltasks)
+        for k in range(B_b):
+            results[k]["Global(ZSTD):"] = round((z_gsizes[k]/1024) / orig_size_kb, 3)
+            results[k]["Global(LZ4):"] = round((l_gsizes[k]/1024) / orig_size_kb, 3)
+        
+        #Stage 2: Temporal (Needles of 1 X W over N)
+        print("Stage 2: Temporal Analysis...")
+        b_temporal = packed_b.permute(1, 0, 2).contiguous().reshape(packed_b.shape[1] * packed_b.shape[0], packed_b.shape[2]).cpu().numpy()
+        temporaltasks = [[row.tobytes()] for row in b_temporal]
+        z_tsizes = pool.map(zstd_compress_list, temporaltasks)
+        l_tsizes = pool.map(lz4_compress_list, temporaltasks)
+        for k in range(B_b):
+            start_ind = k * packed_b.shape[0]
+            end_ind = (k + 1) * packed_b.shape[0]
+            zstd_size = z_tsizes[start_ind:end_ind]
+            lz4_size = l_tsizes[start_ind:end_ind]
+            results[k]["Temporal(ZSTD):"] = round((sum(zstd_size)/1024) / orig_size_kb, 3)
+            results[k]["Temporal(LZ4):"] = round((sum(lz4_size)/1024) / orig_size_kb, 3)
+        
+        #Stage 3: Spatial (Vertical Columns of 1 x N over B over W) #NOTE: THIS STAGE 3 IS VIBE CODED, need to logic it out and fix and test it first
+        # Stage 3: Spatial (Column-to-Byte-Stream)
+        print("Stage 3: Spatial Analysis (Planar Concatenation)...")
+
+        # 1. Source: packed_n is (N_p, W, B)
+        # We want to group all N_p for a single bitplane, then all W features
+        # Layout: (B, W, N_p)
+        n_spatial = packed_n.permute(2, 1, 0).contiguous().cpu().numpy()
+
+        #B_total = n_spatial.shape[0] # e.g., 512 bitplanes
+        #W_total = n_spatial.shape[1] # e.g., 768 features
+
+        spatial_tasks = []
+
+        # We still iterate through your B/8 groups to keep the results table consistent
+        for k in range(B_b):
+            # Grab the 8 individual bitplanes for this group
+            group_bytes = n_spatial[k*8 : (k+1)*8].tobytes()
+            spatial_tasks.append([group_bytes])
+        z_ssizes = pool.map(zstd_compress_list, spatial_tasks)
+        l_ssizes = pool.map(lz4_compress_list, spatial_tasks)
+        '''
+        for k_group in range(B_b):
+            start_bp = k_group * 8
+            end_bp = (k_group + 1) * 8
+    
+            # Extract the 8 bitplanes for this group
+            # Shape: (8, W, N_p)
+            group_data = n_spatial[start_bp:end_bp]
+    
+            # CONCATENATION STEP: 
+            # We flatten the (8, W, N_p) into one giant byte-string
+            # This places Plane0_F0_N, Plane0_F1_N... Plane1_F0_N... 
+            concatenated_bytes = group_data.tobytes()
+    
+            # Add to the pool tasks
+            spatial_tasks.append([concatenated_bytes])
+
+        # 2. Parallel Compression
+        z_ssizes = pool.map(zstd_compress_list, spatial_tasks)
+        l_ssizes = pool.map(lz4_compress_list, spatial_tasks)
+        '''
+
+        # 3. Calculation
+        # The original size is (8 bitplanes * W features * N_p bytes)
+        # This should match your plane_group_size_kb exactly.
+        #plane_group_size_kb = n_spatial.shape[2] / 1024
+        for k in range(B_b):
+            results[k]["Spatial(ZSTD):"] = round((z_ssizes[k]/1024) / orig_size_kb, 3)
+            results[k]["Spatial(LZ4):"] = round((l_ssizes[k]/1024) / orig_size_kb, 3)
+    
+    #now print the results
+    df = pd.DataFrame(list(results.values())).sort_values("Bitplane", ascending=False)
+    pd.set_option('display.max_columns', None)
+    print(df)
+    return df
+
+def check_tensor_entropy(tensor_d):
+    import torch
+    # Expects shape (N, B, W)
+    N, B, W = tensor_d.shape
+    print(f"\n--- BITPLANE ENTROPY CHECK (Shape: {N}x{B}x{W}) ---")
+    print(f"{'Plane':<10} | {'Mean (Bias)':<15} | {'Status'}")
+    print("-" * 45)
+
+    for k in range(B):
+        # Isolate plane k and calculate mean
+        # .float() is necessary because uint8 means will truncate
+        bias = tensor_d[:, k, :].to(torch.float32).mean().item()
+        
+        # Determine status
+        if 0.48 <= bias <= 0.52:
+            status = "Random (Incompressible)"
+        elif bias < 0.1 or bias > 0.9:
+            status = "Highly Structured"
+        else:
+            status = "Partial Structure"
+
+        # Only print the first few, middle, and last few to avoid spam
+        if k < 4 or k > B - 5 or k == B // 2:
+            print(f"Bitplane {k:<2} | {bias:<15.4f} | {status}")
+        elif k == 4:
+            print("...")
+
+# Example usage inside your benchmark:
+# check_tensor_entropy(tensor_d)
 
 def run_phased_benchmark0(tensor_d, form, variant):
     import torch
@@ -963,6 +1214,10 @@ def initialization():
     
 if __name__ == '__main__':
     initialization() #call it
+    #to do 2/21+/26:
+    # - Finish your LZ4+ZSTD simulation code (tensor fixes mostly done already, //
+    # //just fix when B_b goes to 1, skip lots of the compression analysis, depending on the tensor)
+    
     #to do 2/20+/26:
     # - Highest priority: Port your LZ4+ZSTD simulation code that is already here with the pack_bits function //
     # //so you can start actually doing analysis
