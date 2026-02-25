@@ -302,7 +302,35 @@ def get_unsigned_dtype(basetype):
         return mapping.get(basetype, torch.uint32)
     return mapping.get(basetype, default_return_type)
 
-def direct_bitplane(matr): #this is for non-quantized bitplanes, returns a pair, one is vertical and the other is horizontal
+def direct_bitplane(tens_emb): #replaces the older version
+    import torch
+    tens_bits = tens_emb.element_size() * 8
+    if(tens_bits == 32):
+        view_type = torch.int32
+    elif(tens_bits == 8):
+        view_type = torch.int8
+    elif(tens_bits == 16):
+        view_type = torch.int16
+    else:
+        view_type = torch.int32 #default fallback
+    
+    tens_signed = tens_emb.detach().view(view_type)
+    bits = torch.arange(tens_bits - 1, -1, -1, device=tens_emb.device, dtype=torch.int32)
+    mask = torch.tensor(1, device=tens_emb.device, dtype=view_type)
+    planes_horizontal = (tens_signed.unsqueeze(1) >> bits.view(1, -1, 1)) & mask
+    planes_horizontal = planes_horizontal.to(torch.uint8).contiguous()
+    planes_vertical = (tens_signed.unsqueeze(0) >> bits.view(-1, 1, 1)) & mask
+    planes_vertical = planes_vertical.to(torch.uint8).contiguous()
+    planes_vertical = planes_vertical.permute(2,0,1).contiguous()
+    if(print_stage3 == True):
+        print("\nSTAGE 3: Bitplane Disaggregation (raw/direct): H: " + str(planes_horizontal.shape) + "; V: " + str(planes_vertical.shape) + ": ")
+        print("Horizontal Raw: ")
+        print(planes_horizontal)
+        print("Vertical Raw: ")
+        print(planes_vertical)
+    return planes_horizontal, planes_vertical
+
+def direct_bitplane0(matr): #this is for non-quantized bitplanes, returns a pair, one is vertical and the other is horizontal
     import torch
     from multiprocessing import Pool
     import numpy
