@@ -339,10 +339,63 @@ def zstd_compress_list(data_list):
     return len(c.compress(group))
     #return sum(len(c.compress(b)) for b in data_list)    
 
+#Note: the AI says to do only
+# - Horizontal+Packed_W+Spatial,
+# - Vertical+packed_b+Temporal,
+# - and Horizontal+flattened+Global for now
+#I will do further implementations soon
+def run_phased_benchmark(tensor_d, form, variant): 
+    import torch
+    import multiprocessing
+    import zstandard as zstd
+    import pandas as pd
+    import numpy
+    import lz4.frame
+    
+    #if the original input is not a tensor, convert it to a tensor
+    if(torch.is_tensor(tensor_d) == False):
+        tensor_d = torch.from_numpy(tensor_d).to(ACCELERATION_DEVICE)
+        
+    #get the proper N,W,B values depending on if it is vertical or horizontal (if orig tensor is (N,W,B)), and do rest of setup
+    if(form == "horizontal"): #typically how the CPU handles tokens
+        B,N,W = tensor_d.shape
+        #get the required packed_values
+        packed_w = pack_bits(tensor_d, dim=1) #packed across n in this case
+        packed_b = pack_bits(tensor_d, dim=2) #packed across w in this case
+        #get the required tensor forms for Global, Temporal, and Spatial
+    elif(form == "vertical"): #common for KV-cache optimizations and columnar databases
+        W,B,N = tensor_d.shape
+        #get the required packed_values
+        packed_b = pack_bits(tensor_d, dim=2) #packed across n in this case
+        packed_n = pack_bits(tensor_d, dim=0) #packed across w in this case
+        #get the required tensor forms for Global, Temporal, and Spatial
+    
+    #now universal benchmark setup
+    print("\nLZ4+ZSTD Results for " + form + "-" + variant + ": " + str(tensor_d.shape))#tag modifier title
+    orig_size_kb = (N * W) / (1024 * 8) #gets it in bytes becuase the compressors return size in bytes
+    results = {k: {"Bitplane": k} for k in range(B_b)} #setting up the title
+    cores = min(B_b, multiprocessing.cpu_count())
+    check_tensor_entropy(tensor_d)
+    with multiprocessing.Pool(processes=cores) as pool:
+        if(form == "horizontal"):
+            print("Stage 1: Global Analysis...") #overall compression per bitplane
+            #packed_b
+            print("Stage 2: Temporal Analysis...") #consistency within the dim of a single embedding, across multiple embeddings
+            #packed_b
+            print("Stage 3: Spatial Analysis...") #consistency across all rows/embeddings of a single dim, there are multiple dims
+            #packed_w
+        elif(form == "vertical"):
+            print("Stage 1: Global Analysis...") #overall compression per bitplane
+            #packed_b
+            print("Stage 2: Temporal Analysis...") #consistency across all rows/embeddings of a single dim, there are multiple dims
+            #packed_b
+            print("Stage 3: Spatial Analysis...") #consistency across all dims of a single embedding/row, there are multiple embeddings/rows
+            #packed_n
+
 #vibe modded version of previous code, modify it further
 #note: form is for "vertical" or "horizontal"
 #note: variant is for "quant", "scale", and "direct"
-def run_phased_benchmark(tensor_d, form, variant):
+def run_phased_benchmark1(tensor_d, form, variant):
     import torch
     import multiprocessing
     import zstandard as zstd
@@ -430,7 +483,7 @@ def run_phased_benchmark(tensor_d, form, variant):
         #Stage 2: Temporal (Needles of 1 X W over N)
         print("Stage 2: Temporal Analysis...")
         b_temporal = packed_b.permute(1, 0, 2).contiguous().reshape(packed_b.shape[1] * packed_b.shape[0], packed_b.shape[2]).cpu().numpy()
-        temporaltasks = [[row.tobytes()] for row in b_temporal]
+        temporaltasks = [[row.tobytes()] for row in b_temporal] #note to self, I may have some concerns here
         #print("\nDEBUG: Temporal bytes: (" + str(len(temporaltasks)) + ", " + str(len(temporaltasks[0])) + "): ")
         #print(temporaltasks)
         z_tsizes = pool.map(zstd_compress_list, temporaltasks)
