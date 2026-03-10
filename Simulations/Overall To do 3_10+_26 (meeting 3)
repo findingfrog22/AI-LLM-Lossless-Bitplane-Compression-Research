@@ -1,9 +1,9 @@
 Our next task is to work on the overall simulation, we need code that can handle vector embeddings and data from different file types, sources, and formats
-To do 3/6+/26: (B0.7.6)
-- Highest Priority: Finish LZ4+ZSTD Global, Temporal, and Spatial Code (port pack_bits function to the bitpacking phase of your code)
+To do 3/10+/26: (B0.7.7)
+- Highest Priority: Finish LZ4+ZSTD Global, Temporal, and Spatial Code (must account for vertical and horizontal properly)
 - Check the accuracy of this simulation vs previous simulation (bitplaning and binstring conversion) (and check if formatting and conversions and bitplane stuff is correct)
 - NOTE: testing debugging simulation verified, will start porting over changes from stage 6 to main simulation. Will test results further
-- Implement changes from test simulation to main simulation (mainly stage 6)
+- To do Debug A0.4: Complete 5th rewrite of run_staged_benchmark (now accounts for both vertical and horizontal tensor bitplane orientations)
 
 Some of the lower priority tasks:
 - adding explantions
