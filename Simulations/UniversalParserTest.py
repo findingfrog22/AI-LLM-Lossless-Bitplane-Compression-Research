@@ -322,12 +322,12 @@ def direct_bitplane(tens_emb): #replaces the older version
     planes_vertical = (tens_signed.unsqueeze(0) >> bits.view(-1, 1, 1)) & mask
     planes_vertical = planes_vertical.to(torch.uint8).contiguous()
     planes_vertical = planes_vertical.permute(2,0,1).contiguous()
-    if(print_stage3 == True):
-        print("\nSTAGE 3: Bitplane Disaggregation (raw/direct): H: " + str(planes_horizontal.shape) + "; V: " + str(planes_vertical.shape) + ": ")
-        print("Horizontal Raw: ")
-        print(planes_horizontal)
-        print("Vertical Raw: ")
-        print(planes_vertical)
+    #if(print_stage3 == True):
+        #print("\nSTAGE 3: Bitplane Disaggregation (raw/direct): H: " + str(planes_horizontal.shape) + "; V: " + str(planes_vertical.shape) + ": ")
+        #print("Horizontal Raw: ")
+        #print(planes_horizontal)
+        #print("Vertical Raw: ")
+        #print(planes_vertical)
     return planes_horizontal, planes_vertical
 
 def direct_bitplane0(matr): #this is for non-quantized bitplanes, returns a pair, one is vertical and the other is horizontal
@@ -683,6 +683,144 @@ def multilayer(matrix):
 #note: form is for "vertical" or "horizontal"
 #note: variant is for "quant", "scale", and "direct"
 def run_phased_benchmark(tensor_d, form, variant):
+    import torch
+    import multiprocessing
+    import zstandard as zstd
+    import pandas as pd
+    import numpy
+    import lz4.frame
+    
+    #if the original input is not a tensor, convert it to a tensor
+    if(torch.is_tensor(tensor_d) == False):
+        tensor_d = torch.from_numpy(tensor_d).to(ACCELERATION_DEVICE)
+    
+    #standardize the tensor arrangement
+    #first, we will standardize it to the bitplanes being horizontal, this is faster on CPU SIMD for LZ4+ZSTD compression
+    #standardize the tensors to the form (N, B, W), where B is number of bitplanes, while W is dim of vector, N is number of rows
+    #if((form == "vertical") and (variant == "scale")):
+        #tensor_d = tensor_d.permute(2, 1, 0).contiguous()
+    #elif((form == "horizontal") and (variant == "scale")):
+        #tensor_d = tensor_d.permute(1, 0, 2).contiguous()
+    
+    #First, get the dimensions/shape of the incoming tensor
+    N, B, W = tensor_d.shape
+    #where:
+    # - N = height (typically the number of rows)
+    # - W = width (typically dim of vector embedding)
+    # - B = depth (typically the length of bitplane or number of bits in msb)
+    
+    print("\nDEBUG: packed input tensor: " + str(tensor_d.shape) + " [Original Bitplanes]: ")
+    print(tensor_d)
+    packed_n = pack_bits(tensor_d, dim=0)#for spatial
+    print("\nDEBUG: packed_n tensor: " + str(packed_n.shape) + " [for Spatial]: ")
+    print(packed_n)
+    packed_b = pack_bits(tensor_d, dim=2) #for global and temporal [NOTE: NOW IT IS PACKED_W, it fits better]
+    print("\nDEBUG: packed_b tensor: " + str(packed_b.shape) + " [for Global and Temporal]: ")
+    print(packed_b)
+    #packed_w = pack_bits(tensor_d, dim=1) #experimental, packed_w
+    #print("\OPTIONAL DEBUG: packed_w tensor: " + str(packed_w.shape) + " [for Curiosity]: ")
+    #print(packed_w)
+    
+    print("\nDEBUG: SHAPE OF PACKED_B: " + str(packed_b.shape))
+    B_b = packed_b.shape[1] #SO YOU NEED TO ACCOUNT FOR WHEN IT IS 1, just skip most of the compression analysis (2/21+/26)
+    print("\nDEBUG: B_b: " + str(B_b))
+    
+    #now for the LZ4+ZSTD Benchmarking
+    #first, start with preparation
+    
+    #now, we do shape and calculations
+    #N_n, B_n, W_n = packed_n.shape
+    #N_b, B_b, W_b = packed_b.shape
+    #orig_size_n_kb = (N_n * W_n) / 1024
+    orig_size_kb = (N * W) / (1024 * 8) #gets it in bytes becuase the compressors return size in bytes
+    print("\nDEBUG: orig_size_kb: " + str(orig_size_kb))
+    
+    results = {k: {"Bitplane": k} for k in range(B_b)}
+    cores = min(B_b, multiprocessing.cpu_count())
+    
+    check_tensor_entropy(tensor_d)
+    
+    with multiprocessing.Pool(processes=cores) as pool:
+        #Stage 1: Global (Slices of N x W)
+        print("Stage 1: Global Analysis...")
+        b_global = packed_b.permute(1, 0, 2).contiguous().reshape(packed_b.shape[1], packed_b.shape[0] * packed_b.shape[2]).cpu().numpy()
+        #print("\nDEBUG: Global shape: " + str(b_global.shape))
+        globaltasks = [[b_global[k].tobytes()] for k in range(B_b)]
+        #print("\nDEBUG: Global bytes: (" + str(len(globaltasks)) + ", " + str(len(globaltasks[0])) + ", " + str(len(globaltasks[0][0])) + "): ")
+        #print(globaltasks)
+        z_gsizes = pool.map(zstd_compress_list, globaltasks)
+        l_gsizes = pool.map(lz4_compress_list, globaltasks)
+        for k in range(B_b):
+            results[k]["Global(ZSTD):"] = round((z_gsizes[k]/1024) / orig_size_kb, 3)
+            results[k]["Global(LZ4):"] = round((l_gsizes[k]/1024) / orig_size_kb, 3)
+        
+        #Stage 2: Temporal (Needles of 1 X W over N)
+        print("Stage 2: Temporal Analysis...")
+        b_temporal = packed_b.permute(1, 0, 2).contiguous().reshape(packed_b.shape[1] * packed_b.shape[0], packed_b.shape[2]).cpu().numpy()
+        temporaltasks = [[row.tobytes()] for row in b_temporal] #note to self, I may have some concerns here
+        #print("\nDEBUG: Temporal bytes: (" + str(len(temporaltasks)) + ", " + str(len(temporaltasks[0])) + "): ")
+        #print(temporaltasks)
+        z_tsizes = pool.map(zstd_compress_list, temporaltasks)
+        l_tsizes = pool.map(lz4_compress_list, temporaltasks)
+        for k in range(B_b):
+            start_ind = k * packed_b.shape[0]
+            end_ind = (k + 1) * packed_b.shape[0]
+            zstd_size = z_tsizes[start_ind:end_ind]
+            lz4_size = l_tsizes[start_ind:end_ind]
+            results[k]["Temporal(ZSTD):"] = round((sum(zstd_size)/1024) / orig_size_kb, 3)
+            results[k]["Temporal(LZ4):"] = round((sum(lz4_size)/1024) / orig_size_kb, 3)
+        
+        #Stage 3: Spatial (Vertical Columns of 1 x N over B over W) #NOTE: THIS STAGE 3 IS VIBE CODED, need to logic it out and fix and test it first
+        # Stage 3: Spatial (Column-to-Byte-Stream)
+        print("Stage 3: Spatial Analysis (Planar Concatenation)...")
+        
+        #step 1, get it into pieces
+        n_spatial = packed_n.permute(2, 1, 0).contiguous().cpu().numpy() #if original is (N//8,W,B), then result is (B,W,N//8)
+        #n_spatial = packed_n.permute(1, 2, 0).contiguous().cpu().numpy() #ai wants this one
+        print("\nDEBUG: n_spatial: " + str(n_spatial.shape) + " : ")
+        print(n_spatial)
+        spatial_bitplanes = [n_spatial[b, :, :] for b in range(B_b)]
+        print("\nDEBUG: spatial_bitplanes: ")
+        print(spatial_bitplanes)
+        
+        #step 2, set it up into tasks
+        #perform multithreaded compression on each bitplane individually. will slow down drastically if high dimensioned
+        z_bp_sizes = list()
+        l_bp_sizes = list()
+        for bitplane in spatial_bitplanes:
+            print("\nDEBUG: SPATIAL BITPLANE TO COMPRESS: ")
+            print(bitplane)
+            zstd_sizes_bp = pool.map(zstd_compress_list, bitplane) #get the compressed sizes for each N//8 in bitplane
+            lz4_sizes_bp = pool.map(lz4_compress_list, bitplane) #get the compressed sizes for each N//8 in bitplane
+            
+            #print("zstd spatial sizes specific bitplane: ")
+            #print(zstd_sizes_bp)
+            #print("lz4 spatial sizes specific bitplane: ")
+            #print(lz4_sizes_bp)
+            #add compressed sizes up
+            z_bp_sizes.append(sum(zstd_sizes_bp))
+            l_bp_sizes.append(sum(lz4_sizes_bp))
+            
+        #print("z_bp_sizes (all bitplanes): ")
+        #print(z_bp_sizes)
+        #print("l_bp_sizes (all bitplanes): ")
+        #print(l_bp_sizes)
+        
+        #steps 3 + 4, get ratios and print
+        for k in range(B_b):
+            results[k]["Spatial(ZSTD):"] = round((z_bp_sizes[k]/1024) / orig_size_kb, 3)
+            results[k]["Spatial(LZ4):"] = round((l_bp_sizes[k]/1024) / orig_size_kb, 3)
+    
+    #now print the results
+    df = pd.DataFrame(list(results.values())).sort_values("Bitplane", ascending=False)
+    pd.set_option('display.max_columns', None)
+    print(df)
+    return df
+
+#vibe modded version of previous code, modify it further
+#note: form is for "vertical" or "horizontal"
+#note: variant is for "quant", "scale", and "direct"
+def run_phased_benchmark0(tensor_d, form, variant):
     import torch
     import multiprocessing
     import zstandard as zstd
@@ -1141,7 +1279,7 @@ def initialization():
         #the RLE below isn't surprising at all, since each bitplane here only has 1 element
         scale_horizontal_row = RLE_bitplane_compressibility(horizontal_bitplane_scale_row, "horizontal", "horizontal_bitplane_scale_row")
         #LZ4 + ZSTD
-        run_phased_benchmark(horizontal_bitplane_scale_row, "horizontal", "scale")
+        #[WILL UNCOMMENT AFTER FIX]#run_phased_benchmark(horizontal_bitplane_scale_row, "horizontal", "scale")
         #Entropy
         
         #overall RLE
@@ -1208,7 +1346,7 @@ def initialization():
         #For RLE below, not surprising since each bitplane only has 1 element
         scale_vertical_col = RLE_bitplane_compressibility(vertical_bitplane_scale_col, "vertical", "vertical_bitplane_scale_col")
         #LZ4 + ZSTD
-        run_phased_benchmark(vertical_bitplane_scale_col, "vertical", "scale")
+        #[WILL UNCOMMENT AFTER FIX]#run_phased_benchmark(vertical_bitplane_scale_col, "vertical", "scale")
         #Entropy
         
         #Overall
