@@ -321,29 +321,28 @@ def pack_bits(tensor_r, dim): #NOTE: both of these modes are confirmed correct a
         raise ValueError("Dimension for pack_bits must be either 0 or 2...")
     
 #LZ4+ZSTD Compression Analysis (Stage 6)
-def lz4_compress_list(data_list):
+def lz4_compress_list(data_list): #takes in a list
     import lz4.frame
-    group = b"".join(data_list)
-    print("\nDEBUG: LZ4 precompressed bytes: " + str(len(group)) + " : ")
-    print(group)
+    if(isinstance(data_list, list)):
+        group = b"".join(data_list)
+    else:
+        group = bytes([data_list])
+    print("\nDEBUG: LZ4 precompressed bytes: " + str(len(group)) + " : " + str(group))
     return len(lz4.frame.compress(group, block_size=BLOCK_SIZE))
     #return sum(len(lz4.frame.compress(a, block_size=BLOCK_SIZE)) for a in data_list)
 
-def zstd_compress_list(data_list):
+def zstd_compress_list(data_list): #takes in a list
     import zstandard as zstd
     """Compresses a list of byte-buffers and returns the total compressed size."""
-    group = b"".join(data_list)
-    print("\nDEBUG: ZSTD precompressed bytes: " + str(len(group)) + " : ")
-    print(group)
+    if(isinstance(data_list, list)):
+        group = b"".join(data_list)
+    else:
+        group = bytes([data_list])
+    print("\nDEBUG: ZSTD precompressed bytes: " + str(len(group)) + " : " + str(group))
     c = zstd.ZstdCompressor(level=3)
     return len(c.compress(group))
     #return sum(len(c.compress(b)) for b in data_list)    
 
-#Note: the AI says to do only
-# - Horizontal+Packed_W+Spatial,
-# - Vertical+packed_b+Temporal,
-# - and Horizontal+flattened+Global for now
-#I will do further implementations soon
 def run_phased_benchmark(tensor_d, form, variant): 
     import torch
     import multiprocessing
@@ -358,9 +357,9 @@ def run_phased_benchmark(tensor_d, form, variant):
         
     #get the proper N,W,B values depending on if it is vertical or horizontal (if orig tensor is (N,W,B)), and do rest of setup
     if(form == "horizontal"): #typically how the CPU handles tokens
-        B,N,W = tensor_d.shape
+        N,B,W = tensor_d.shape
         #get the required packed_values
-        packed_w = pack_bits(tensor_d, dim=1) #packed across n in this case
+        packed_n = pack_bits(tensor_d, dim=0) #packed across n in this case
         packed_b = pack_bits(tensor_d, dim=2) #packed across w in this case
         #get the required tensor forms for Global, Temporal, and Spatial
     elif(form == "vertical"): #common for KV-cache optimizations and columnar databases
@@ -373,203 +372,88 @@ def run_phased_benchmark(tensor_d, form, variant):
     #now universal benchmark setup
     print("\nLZ4+ZSTD Results for " + form + "-" + variant + ": " + str(tensor_d.shape))#tag modifier title
     orig_size_kb = (N * W) / (1024 * 8) #gets it in bytes becuase the compressors return size in bytes
+    print("B: " + str(B))
+    B_b = B
     results = {k: {"Bitplane": k} for k in range(B_b)} #setting up the title
     cores = min(B_b, multiprocessing.cpu_count())
     check_tensor_entropy(tensor_d)
     with multiprocessing.Pool(processes=cores) as pool:
-        if(form == "horizontal"):
+        if(form == "horizontal"): #(N,B,W)
             print("Stage 1: Global Analysis...") #overall compression per bitplane
-            #packed_b
-            print("Stage 2: Temporal Analysis...") #consistency within the dim of a single embedding, across multiple embeddings
-            #packed_b
-            print("Stage 3: Spatial Analysis...") #consistency across all rows/embeddings of a single dim, there are multiple dims
-            #packed_w
-        elif(form == "vertical"):
-            print("Stage 1: Global Analysis...") #overall compression per bitplane
-            #packed_b
+            #packed_b (packs across w)
+            b_global = packed_b.permute(1,0,2).contiguous().cpu().numpy()
+            globaltasks = [[b_global[k].tobytes()] for k in range(B_b)]
+            z_gsizes = pool.map(zstd_compress_list, globaltasks)
+            l_gsizes = pool.map(lz4_compress_list, globaltasks)
+            for k in range(B_b):
+                results[k]["Global(ZSTD):"] = round((z_gsizes[k]/1024) / orig_size_kb, 3)
+                results[k]["Global(LZ4):"] = round((l_gsizes[k]/1024) / orig_size_kb, 3)
             print("Stage 2: Temporal Analysis...") #consistency across all rows/embeddings of a single dim, there are multiple dims
-            #packed_b
+            #packed_n (packs across n) #this one is pretty important for redundancy across all rows per dim per bitplane [main horizontal benchmark]
+            n_spatial = packed_n.permute(1,2,0).contiguous().cpu().numpy()
+            spatialtasks = list()
+            for k in range(B_b):
+                bitplanetasks = [[n_spatial[k][x].tobytes()] for x in range(n_spatial.shape[1])]
+                z_ssizes = sum(pool.map(zstd_compress_list, bitplanetasks))
+                l_ssizes = sum(pool.map(lz4_compress_list, bitplanetasks))
+                #print("Bitplane: " + str(k))
+                #for n in bitplane:
+                    #z_ssizes += sum(pool.map(zstd_compress_list, [n.tobytes()]))
+                    #l_ssizes += sum(pool.map(lz4_compress_list, [n.tobytes()]))
+                results[k]["Temporal(ZSTD):"] = round((z_ssizes/1024) / orig_size_kb, 3)
+                results[k]["Temporal(LZ4):"] = round((l_ssizes/1024) / orig_size_kb, 3)
+            print("Stage 3: Spatial Analysis...") #consistency within the dim of a single embedding, across multiple embeddings
+            #packed_b (packs across w)
+            b_temporal = packed_b.permute(1,0,2).contiguous().cpu().numpy()
+            temporaltasks = list()
+            for k in range(B_b):
+                bitplanetasks = [[b_temporal[k][x].tobytes()] for x in range(b_temporal.shape[1])]
+                z_tsizes = sum(pool.map(zstd_compress_list, bitplanetasks))
+                l_tsizes = sum(pool.map(lz4_compress_list, bitplanetasks))
+                #for n in bitplane:
+                    #z_tsizes += sum(pool.map(zstd_compress_list, [n.tobytes()]))
+                    #l_tsizes += sum(pool.map(lz4_compress_list, [n.tobytes()]))
+                results[k]["Spatial(ZSTD):"] = round((z_tsizes/1024) / orig_size_kb, 3)
+                results[k]["Spatial(LZ4):"] = round((l_tsizes/1024) / orig_size_kb, 3)
+        elif(form == "vertical"): #(W,B,N)
+            print("Stage 1: Global Analysis...") #overall compression per bitplane
+            #packed_b (packs across n), Seems like an important benchmark?
+            b_global = packed_b.permute(1,0,2).contiguous().cpu().numpy() #(W,B,N) --> (B,W,N) for access reasons
+            globaltasks = [[b_global[x].tobytes()] for x in range(B_b)]
+            z_gsizes = pool.map(zstd_compress_list, globaltasks)
+            l_gsizes = pool.map(lz4_compress_list, globaltasks)
+            for k in range(B_b):
+                results[k]["Global(ZSTD):"] = round((z_gsizes[k]/1024) / orig_size_kb, 3)
+                results[k]["Global(LZ4):"] = round((l_gsizes[k]/1024) / orig_size_kb, 3)
+            print("Stage 2: Temporal Analysis...") #consistency across all rows/embeddings of a single dim, there are multiple dims
+            #packed_b (packs across n), This is an important benchmark, finds the redundancy per bitplane across all vector embeddings/tokens, per vector dim
+            b_temporal = packed_b.permute(1,0,2).contiguous().cpu().numpy() #(W,B,N) --> (B,W,N) for access reasons
+            temporaltasks = list()
+            for k in range(B_b):
+                bitplanetasks = [[b_temporal[k][x].tobytes()] for x in range(b_temporal.shape[1])]
+                z_tsizes = sum(pool.map(zstd_compress_list, bitplanetasks))
+                l_tsizes = sum(pool.map(lz4_compress_list, bitplanetasks))
+                #for w in bitplane:
+                    #z_tsizes += sum(pool.map(zstd_compress_list, [w.tobytes()]))
+                    #l_tsizes += sum(pool.map(lz4_compress_list, [w.tobytes()]))
+                results[k]["Temporal(ZSTD):"] = round((z_tsizes/1024) / orig_size_kb, 3)
+                results[k]["Temporal(LZ4):"] = round((l_tsizes/1024) / orig_size_kb, 3)
             print("Stage 3: Spatial Analysis...") #consistency across all dims of a single embedding/row, there are multiple embeddings/rows
-            #packed_n
-
-#vibe modded version of previous code, modify it further
-#note: form is for "vertical" or "horizontal"
-#note: variant is for "quant", "scale", and "direct"
-def run_phased_benchmark1(tensor_d, form, variant):
-    import torch
-    import multiprocessing
-    import zstandard as zstd
-    import pandas as pd
-    import numpy
-    import lz4.frame
+            #packed_n (packs across w)
+            n_spatial = packed_n.permute(1,2,0).contiguous().cpu().numpy() #(W,B,N) --> (B,N,W) for access reasons
+            spatialtasks = list()
+            for k in range(B_b):
+                bitplanetasks = [[n_spatial[k][x].tobytes()] for x in range(n_spatial.shape[1])]
+                z_ssizes = sum(pool.map(zstd_compress_list, bitplanetasks))
+                l_ssizes = sum(pool.map(lz4_compress_list, bitplanetasks))
+                #print("Bitplane: " + str(k))
+                #for n in bitplane:
+                    #z_ssizes += sum(pool.map(zstd_compress_list, [n.tobytes()]))
+                    #l_ssizes += sum(pool.map(lz4_compress_list, [n.tobytes()]))
+                results[k]["Spatial(ZSTD):"] = round((z_ssizes/1024) / orig_size_kb, 3)
+                results[k]["Spatial(LZ4):"] = round((l_ssizes/1024) / orig_size_kb, 3)
     
-    #if the original input is not a tensor, convert it to a tensor
-    if(torch.is_tensor(tensor_d) == False):
-        tensor_d = torch.from_numpy(tensor_d).to(ACCELERATION_DEVICE)
-    
-    #standardize the tensor arrangement
-    #first, we will standardize it to the bitplanes being horizontal, this is faster on CPU SIMD for LZ4+ZSTD compression
-    #standardize the tensors to the form (N, B, W), where B is number of bitplanes, while W is dim of vector, N is number of rows
-    #if(form == "vertical"):
-        #tensor_d = tensor_d.permute(2, 1, 0)
-    #elif(form == "horizontal"):
-        #tensor_d = tensor_d.permute(1, 0, 2)
-    
-    #First, get the dimensions/shape of the incoming tensor
-    N, B, W = tensor_d.shape
-    #where:
-    # - N = height (typically the number of rows)
-    # - W = width (typically dim of vector embedding)
-    # - B = depth (typically the length of bitplane or number of bits in msb)
-    
-    print("\nDEBUG: packed input tensor: " + str(tensor_d.shape) + " [Original Bitplanes]: ")
-    print(tensor_d)
-    packed_n = pack_bits(tensor_d, dim=0)#for spatial
-    print("\nDEBUG: packed_n tensor: " + str(packed_n.shape) + " [for Spatial]: ")
-    print(packed_n)
-    packed_b = pack_bits(tensor_d, dim=2) #for global and temporal [NOTE: NOW IT IS PACKED_W, it fits better]
-    print("\nDEBUG: packed_b tensor: " + str(packed_b.shape) + " [for Global and Temporal]: ")
-    print(packed_b)
-    #packed_w = pack_bits(tensor_d, dim=1) #experimental, packed_w
-    #print("\OPTIONAL DEBUG: packed_w tensor: " + str(packed_w.shape) + " [for Curiosity]: ")
-    #print(packed_w)
-    
-    '''
-    if((N>1)and(W>1)and(B>1)):
-        permute_n = packed_n.permute(0, 2, 1)
-        print("\nEXTRA: permuted_packed_n: " + str(permute_n.shape))
-        print(permute_n)
-        permute_b = packed_b.permute(0, 2, 1)
-        print("\nEXTRA: permuted_packed_b: " + str(permute_b.shape))
-        print(permute_b)
-        permute_w = packed_w.permute(0, 2, 1)
-        print("\nEXTRA: permuted_packed_w: " + str(permute_w.shape))
-        print(permute_w)
-        pass
-    '''
-    print("\nDEBUG: SHAPE OF PACKED_B: " + str(packed_b.shape))
-    B_b = packed_b.shape[1] #SO YOU NEED TO ACCOUNT FOR WHEN IT IS 1, just skip most of the compression analysis (2/21+/26)
-    print("\nDEBUG: B_b: " + str(B_b))
-    
-    #now for the LZ4+ZSTD Benchmarking
-    #first, start with preparation
-    
-    #now, we do shape and calculations
-    #N_n, B_n, W_n = packed_n.shape
-    #N_b, B_b, W_b = packed_b.shape
-    #orig_size_n_kb = (N_n * W_n) / 1024
-    orig_size_kb = (N * W) / (1024 * 8) #gets it in bytes becuase the compressors return size in bytes
-    print("\nDEBUG: orig_size_kb: " + str(orig_size_kb))
-    
-    results = {k: {"Bitplane": k} for k in range(B_b)}
-    cores = min(B_b, multiprocessing.cpu_count())
-    
-    check_tensor_entropy(tensor_d)
-    
-    with multiprocessing.Pool(processes=cores) as pool:
-        #Stage 1: Global (Slices of N x W)
-        print("Stage 1: Global Analysis...")
-        b_global = packed_b.permute(1, 0, 2).contiguous().reshape(packed_b.shape[1], packed_b.shape[0] * packed_b.shape[2]).cpu().numpy()
-        #print("\nDEBUG: Global shape: " + str(b_global.shape))
-        globaltasks = [[b_global[k].tobytes()] for k in range(B_b)]
-        #print("\nDEBUG: Global bytes: (" + str(len(globaltasks)) + ", " + str(len(globaltasks[0])) + ", " + str(len(globaltasks[0][0])) + "): ")
-        #print(globaltasks)
-        z_gsizes = pool.map(zstd_compress_list, globaltasks)
-        l_gsizes = pool.map(lz4_compress_list, globaltasks)
-        for k in range(B_b):
-            results[k]["Global(ZSTD):"] = round((z_gsizes[k]/1024) / orig_size_kb, 3)
-            results[k]["Global(LZ4):"] = round((l_gsizes[k]/1024) / orig_size_kb, 3)
-        
-        #Stage 2: Temporal (Needles of 1 X W over N)
-        print("Stage 2: Temporal Analysis...")
-        b_temporal = packed_b.permute(1, 0, 2).contiguous().reshape(packed_b.shape[1] * packed_b.shape[0], packed_b.shape[2]).cpu().numpy()
-        temporaltasks = [[row.tobytes()] for row in b_temporal] #note to self, I may have some concerns here
-        #print("\nDEBUG: Temporal bytes: (" + str(len(temporaltasks)) + ", " + str(len(temporaltasks[0])) + "): ")
-        #print(temporaltasks)
-        z_tsizes = pool.map(zstd_compress_list, temporaltasks)
-        l_tsizes = pool.map(lz4_compress_list, temporaltasks)
-        for k in range(B_b):
-            start_ind = k * packed_b.shape[0]
-            end_ind = (k + 1) * packed_b.shape[0]
-            zstd_size = z_tsizes[start_ind:end_ind]
-            lz4_size = l_tsizes[start_ind:end_ind]
-            results[k]["Temporal(ZSTD):"] = round((sum(zstd_size)/1024) / orig_size_kb, 3)
-            results[k]["Temporal(LZ4):"] = round((sum(lz4_size)/1024) / orig_size_kb, 3)
-        
-        #Stage 3: Spatial (Vertical Columns of 1 x N over B over W) #NOTE: THIS STAGE 3 IS VIBE CODED, need to logic it out and fix and test it first
-        # Stage 3: Spatial (Column-to-Byte-Stream)
-        print("Stage 3: Spatial Analysis (Planar Concatenation)...")
-        
-        #step 1, get it into pieces
-        n_spatial = packed_n.permute(2, 1, 0).contiguous().cpu().numpy()
-        print("\nDEBUG: n_spatial: " + str(n_spatial.shape) + " : ")
-        print(n_spatial)
-        spatial_bitplanes = [n_spatial[b, :, :] for b in range(B_b)]
-        print("\nDEBUG: spatial_bitplanes: ")
-        print(spatial_bitplanes)
-        
-        #step 2, set it up into tasks
-        #perform multithreaded compression on each bitplane individually. will slow down drastically if high dimensioned
-        z_bp_sizes = list()
-        l_bp_sizes = list()
-        for bitplane in spatial_bitplanes:
-            print("\nDEBUG: SPATIAL BITPLANE TO COMPRESS: ")
-            print(bitplane)
-            zstd_sizes_bp = pool.map(zstd_compress_list, bitplane) #get the compressed sizes for each N//8 in bitplane
-            lz4_sizes_bp = pool.map(lz4_compress_list, bitplane) #get the compressed sizes for each N//8 in bitplane
-            
-            print("zstd spatial sizes specific bitplane: ")
-            print(zstd_sizes_bp)
-            print("lz4 spatial sizes specific bitplane: ")
-            print(lz4_sizes_bp)
-            #add compressed sizes up
-            z_bp_sizes.append(sum(zstd_sizes_bp))
-            l_bp_sizes.append(sum(lz4_sizes_bp))
-            
-        print("z_bp_sizes (all bitplanes): ")
-        print(z_bp_sizes)
-        print("l_bp_sizes (all bitplanes): ")
-        print(l_bp_sizes)
-        
-        #steps 3 + 4, get ratios and print
-        for k in range(B_b):
-            results[k]["Spatial(ZSTD):"] = round((z_bp_sizes[k]/1024) / orig_size_kb, 3)
-            results[k]["Spatial(LZ4):"] = round((l_bp_sizes[k]/1024) / orig_size_kb, 3)
-
-        '''
-        # 1. Source: packed_n is (N_p, W, B)
-        # We want to group all N_p for a single bitplane, then all W features
-        # Layout: (B, W, N_p)
-        n_spatial = packed_n.permute(2, 1, 0).contiguous().cpu().numpy()
-        print("\nDEBUG: n_spatial: " + str(n_spatial.shape) + " : ")
-        print(n_spatial)
-
-        #B_total = n_spatial.shape[0] # e.g., 512 bitplanes
-        #W_total = n_spatial.shape[1] # e.g., 768 features
-
-        spatial_tasks = []
-
-        # We still iterate through your B/8 groups to keep the results table consistent
-        for k in range(B_b):
-            # Grab the 8 individual bitplanes for this group
-            print("K: " + str(k))
-            group_bytes = n_spatial[k*8 : (k+1)*8].tobytes()
-            spatial_tasks.append([group_bytes])
-        print("\nDEBUG: Spatial bytes: (" + str(len(spatial_tasks)) + ", " + str(len(spatial_tasks[0])) + "): ")
-        print(spatial_tasks)
-        z_ssizes = pool.map(zstd_compress_list, spatial_tasks)
-        l_ssizes = pool.map(lz4_compress_list, spatial_tasks)
-
-        # 3. Calculation
-        # The original size is (8 bitplanes * W features * N_p bytes)
-        # This should match your plane_group_size_kb exactly.
-        #plane_group_size_kb = n_spatial.shape[2] / 1024
-        for k in range(B_b):
-            results[k]["Spatial(ZSTD):"] = round((z_ssizes[k]/1024) / orig_size_kb, 3)
-            results[k]["Spatial(LZ4):"] = round((l_ssizes[k]/1024) / orig_size_kb, 3)
-        '''
-    
-    #now print the results
+    #now, print and return the results
     df = pd.DataFrame(list(results.values())).sort_values("Bitplane", ascending=False)
     pd.set_option('display.max_columns', None)
     print(df)
