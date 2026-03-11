@@ -34,6 +34,12 @@ PRINT_COMP = True #prints the LZ4 and ZSTD Compression analytics for the bitplan
 PRINT_DEBUG = False #prints useful info for debugging
 SHOW_EXTRANEOUS_RESULTS = True #default false to improve performance
 
+#features for B0.8.2:
+SHOW_NEGATIVE_COMPRESSION_RATIOS = False
+#Determines whether to compress the uncompressible or not
+# - True: will show negative compression ratios (>1.0) [default]
+# - False: will change any negative compression ratios to 1.0
+
 #some functions
 
 #raw vector tensor retrieval from files
@@ -933,18 +939,23 @@ def initialization():
     
 if __name__ == '__main__':
     initialization() #call it, starts the simulation
-    #to do 2/21+/26:
-    # - Finish your LZ4+ZSTD simulation code (tensor fixes mostly done already, //
-    # //just fix when B_b goes to 1, skip lots of the compression analysis, depending on the tensor)
+    #to do 3/12+/26:
+    # - add a no negative 
+    # - add ZSTD block sizes
+    # - more metrics:
+    # --> Direct file compression
+    # --> avg compression ratio for global, temporal, spatial (for each LZ4 and ZSTD) [averages across all bitplanes]
+    # --> actual compression ratio for global, temporal, spatial (for each LZ4 and ZSTD) [gets sizes of all compressed bitplanes, adds it up, divides by total quantized size of before compression]
+    # --> The previous 2 metrics, but with scalar + quantized
+    # --> The previous 2 metrics, but compared to pre-quantized tensor
+    # --> Raw/Direct versions of these metrics
     
-    #to do 2/20+/26:
-    # - Highest priority: Port your LZ4+ZSTD simulation code that is already here with the pack_bits function //
-    # //so you can start actually doing analysis
-    # - Check the accuracy of this simulation vs previous simulation (and check if formatting and conversions and bitplane stuff is correct)
     #Some of the lower priority tasks:
     # - adding explantions
     # - custom block sizes for compression
     # - direct compression
+    # - adding options for randomized file selection
+    # - adding options for randomized starting row selection
     # - [basically done?, only tested working on .parquet and .npy, havent tested uncompressed jsonl or csv yet] Finish working on the vector embedding extraction (heuristic?) [NOTE: don't do jsonl.zst stuff, Rui said]
     # - maybe direct compression and block size heuristics
     
