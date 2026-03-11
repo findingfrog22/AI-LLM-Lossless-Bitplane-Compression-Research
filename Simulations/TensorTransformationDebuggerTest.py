@@ -7,12 +7,12 @@ SCALE_TYPE = torch.float32
 ACCELERATION_DEVICE = "xpu"
 
 PRINT_DEBUG = True
-print_stage0 = False #prints the original tensor
-print_stage1 = False #prints symmetric scalar quantization details
-print_stage2 = False #prints binary string conversion (optional)
-print_stage3 = False #prints bitplane disaggregation
+print_stage0 = True #prints the original tensor
+print_stage1 = True #prints symmetric scalar quantization details
+print_stage2 = True #prints binary string conversion (optional)
+print_stage3 = True #prints bitplane disaggregation
 print_stage4 = False #prints RLE analysis
-print_stage5 = True #prints bitpacking
+print_stage5 = False #prints bitpacking
 print_stage6 = True #prints LZ4+ZSTD Compression analysis
 
 BLOCK_SIZE = 4096
@@ -487,6 +487,11 @@ def check_tensor_entropy(tensor_d):
             print("...")
 
 def initialization(tens_emb):
+    import numpy
+    import torch
+    import sys
+    numpy.set_printoptions(threshold=sys.maxsize)
+    torch.set_printoptions(profile="full")
     #Step 1.) Test Symmetric Scalar Quantization (row-wise, col-wise, raw)
     row_quant, row_scale = symmetric_scalar_quantization(tens_emb, "row")
     col_quant, col_scale = symmetric_scalar_quantization(tens_emb, "col")
@@ -541,6 +546,46 @@ def initialization(tens_emb):
         print("\npack_b: " + str(packed_b.shape))
         print(packed_b)
     
+    #now lets try this with quantized stuff
+    '''
+    if(print_stage5 == True):
+        print("\nStage 5: Bitpacking:")
+        #first, raw conversions
+        bh_n = pack_bits(bitplane_horizontal,0)
+        bh_w = pack_bits(bitplane_horizontal,1)
+        bh_b = pack_bits(bitplane_horizontal,2)
+        bv_n = pack_bits(bitplane_vertical,0)
+        bv_w = pack_bits(bitplane_vertical,1)
+        bv_b = pack_bits(bitplane_vertical,2)
+    
+        #now try horizontal
+        bqrh_n = pack_bits(bitplane_quant_row_horizontal,0)
+        bqrh_w = pack_bits(bitplane_quant_row_horizontal,1)
+        bqrh_b = pack_bits(bitplane_quant_row_horizontal,2)
+        bsrh_n = pack_bits(bitplane_scale_row_horizontal,0)
+        bsrh_w = pack_bits(bitplane_scale_row_horizontal,1)
+        bsrh_b = pack_bits(bitplane_scale_row_horizontal,2)
+        bqch_n = pack_bits(bitplane_quant_col_horizontal,0)
+        bqch_w = pack_bits(bitplane_quant_col_horizontal,1)
+        bqch_b = pack_bits(bitplane_quant_col_horizontal,2)
+        bsch_n = pack_bits(bitplane_scale_col_horizontal,0)
+        bsch_w = pack_bits(bitplane_scale_col_horizontal,1)
+        bsch_b = pack_bits(bitplane_scale_col_horizontal,2)
+        #now try vertical
+        bqrv_n = pack_bits(bitplane_quant_row_vertical,0)
+        bqrv_w = pack_bits(bitplane_quant_row_vertical,1)
+        bqrv_b = pack_bits(bitplane_quant_row_vertical,2)
+        bsrv_n = pack_bits(bitplane_scale_row_vertical,0)
+        bsrv_w = pack_bits(bitplane_scale_row_vertical,1)
+        bsrv_b = pack_bits(bitplane_scale_row_vertical,2)
+        bqcv_n = pack_bits(bitplane_quant_col_vertical,0)
+        bqcv_w = pack_bits(bitplane_quant_col_vertical,1)
+        bqcv_b = pack_bits(bitplane_quant_col_vertical,2)
+        bscv_n = pack_bits(bitplane_scale_col_vertical,0)
+        bscv_w = pack_bits(bitplane_scale_col_vertical,1)
+        bscv_b = pack_bits(bitplane_scale_col_vertical,2)
+    '''
+    
     #Step 6.) Test LZ4+ZSTD Bitplane Compression Analysis (Global, Temporal, Spatial)
     run_phased_benchmark(bit_data_test, "horizontal", "direct")
     run_phased_benchmark(bit_data_test, "vertical", "direct")
@@ -549,11 +594,43 @@ def initialization(tens_emb):
 if  __name__ == "__main__":
     import numpy
     import torch
-    parquet_data = [[0.5,0.33,0.125],[0.75,0.25,0.375]] #tensor is (N,W), (in this case, (2,3))
+    
+    #parquet_data = [[0.5,0.33,0.125],[0.75,0.25,0.375]] #tensor is (N,W), (in this case, (2,3))
     #parquet_data = [[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0]] #tensor is (N,W), (in this case, (8,8))
+    parquet_data = [[0.5,0.0625,0.4375,0.953125,0.125,0.5625,0.875,0.75],[0.25,0.09375,0.5,0.4375,0.75,0.6875,0.75,0.4375],[0.75,0.4375,0.9375,0.1875,0.66,0.75,0.5,0.33],[0.66,0.84375,0.90625,0.33,0.625,0.8125,0.8125,0.9375],[0.375,0.5625,0.984375,0.7578125,0.25,0.625,0.4375,0.75],[0.625,0.625,0.8125,0.9375,0.5,0.66,0.8125,0.5],[0.125,0.875,0.5703125,0.78125,0.75,0.375,0.90625,0.625],[0.33,0.3125,0.7578125,0.3359375,0.8125,0.8125,0.7734375,0.375]] #tensor is (N,W), (in this case, (8,8))
     Tensor = torch.tensor(parquet_data, dtype=torch.float32)
     #print(format("032b", Tensor.view(torch.uint32)))
     if(print_stage0 == True):
         print("\nInitial Tensor Data: " + str(Tensor.shape))
         print(Tensor)
     initialization(Tensor)
+    '''
+    #i want to test if there is any redundant tensor transformations
+    #data = [[[0,0,0,1],[0,1,1,1],[0,1,0,0]],[[0,0,1,1],[0,0,1,0],[0,1,0,1]],[[0,1,1,0],[1,0,0,0],[1,1,1,0]],[[1,0,1,1],[1,1,1,1],[1,0,0,1]]]
+    data = [[1,7,4],[3,2,5],[6,8,14],[11,15,9]]
+    Tensor = torch.tensor(data, dtype=torch.uint8)
+    print("\nInitial Tensor Data: " + str(Tensor.shape))
+    print(Tensor)
+    #first test horizontal and vertical
+    horizontal, vertical = raw_bitplane(Tensor)
+    print("\nHorizontal Tensor: " + str(horizontal.shape))
+    print(horizontal)
+    print("\nVertical Tensor: " + str(vertical.shape))
+    print(vertical)
+    #then, test
+    # - horizontal: packed_n & packed_b
+    horizontal_n = pack_bits(horizontal,0)
+    print("\nHorizontal Packed_n: " + str(horizontal_n.shape))
+    print(horizontal_n)
+    horizontal_b = pack_bits(horizontal,2)
+    print("\nHorizontal Packed_b: " + str(horizontal_b.shape))
+    print(horizontal_b)
+    # - vertical: packed_n & packed_b
+    vertical_n = pack_bits(vertical,0)
+    print("\nVertical Packed_n: " + str(vertical_n.shape))
+    print(vertical_n)
+    vertical_b = pack_bits(vertical,2)
+    print("\nVertical Packed_b: " + str(vertical_b.shape))
+    print(vertical_b)
+    #then, test the byte-level compression of horizontal and vertical
+    '''
