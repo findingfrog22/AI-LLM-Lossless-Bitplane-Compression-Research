@@ -24,7 +24,14 @@ Early Beta B0.7 - Compression Analysis: (porting features from previous simulati
 - Comparison of Quantized compression analysis to Non-quantized compression analysis
 - more averaged results for more direct comparisons
 
-Late Beta B0.9 - Finishing Touches: 
+Late Beta B0.9.0 - Finished Metrics + Base Functionality:
+- Space saving Metrics
+- Memory VRAM optimizations
+- Custom Block Size Compression
+- Histogram: Vector Embedding Input Range
+- Tested and Verified Computational Operations
+
+Late Beta B0.9.x - Finishing Touches: 
 - File Randomization settings, 
 - Row Selection Settings, 
 - Better print formatting and explanations
