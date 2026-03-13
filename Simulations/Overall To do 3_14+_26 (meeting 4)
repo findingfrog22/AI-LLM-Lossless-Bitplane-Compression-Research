@@ -1,14 +1,14 @@
 Our next task is to work on the overall simulation, we need code that can handle vector embeddings and data from different file types, sources, and formats
-to do 3/13+/26: (B0.8.2)
- - add a no negative 
- - add ZSTD block sizes
- - more metrics:
+to do 3/14+/26: (B0.9.0)
+- more metrics:
 --> Direct file compression
---> avg compression ratio for global, temporal, spatial (for each LZ4 and ZSTD) [averages across all bitplanes]
---> actual compression ratio for global, temporal, spatial (for each LZ4 and ZSTD) [gets sizes of all compressed bitplanes, adds it up, divides by total quantized size of before compression]
---> The previous 2 metrics, but with scalar + quantized
---> The previous 2 metrics, but compared to pre-quantized tensor
---> Raw/Direct versions of these metrics
+--> metric: vs Direct Compression
+--> metric: vs Quant+Scale Compressed (No Bitplaning)
+--> (optional) avg compression ratio for global, temporal, spatial (for each LZ4 and ZSTD) [averages across all bitplanes]
+--> (optional) actual compression ratio for global, temporal, spatial (for each LZ4 and ZSTD) [gets sizes of all compressed bitplanes, adds it up, divides by total quantized size of before compression]
+--> (optional) The previous 2 metrics, but with scalar + quantized
+--> (optional) The previous 2 metrics, but compared to pre-quantized tensor
+--> (optional) Raw/Direct versions of these metrics
 
 to do from meeting 4:
 - wants histogram distribution of input vector embedding data. is the values between 0 and 1? -1 and 1? etc
@@ -19,9 +19,7 @@ to do from meeting 4:
 
 Some of the lower priority tasks:
  - adding explantions
- - custom block sizes for compression
  - direct compression
  - adding options for randomized file selection
  - adding options for randomized starting row selection
  - [basically done?, only tested working on .parquet and .npy, havent tested uncompressed jsonl or csv yet] Finish working on the vector embedding extraction (heuristic?) [NOTE: don't do jsonl.zst stuff, Rui said]
- - maybe direct compression and block size heuristics
