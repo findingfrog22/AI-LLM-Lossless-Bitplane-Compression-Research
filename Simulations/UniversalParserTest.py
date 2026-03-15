@@ -5,7 +5,7 @@ import os
 base_directory = os.path.dirname(os.path.abspath(__file__))
 import torch
 file_path = "" #don't touch this unless you know what you are doing
-NUM_ROWS = 32768 #This is for you to choose, it is the number of vector embeddings (essentially # of tokens)[must be a multiple of 8]
+NUM_ROWS = 4096 #This is for you to choose, it is the number of vector embeddings (essentially # of tokens)[must be a multiple of 8]
 #Note: your NUM_ROWS should ideally exceed your BLOCK_SIZE, and for best results, should be a multiple of BLOCK_SIZE
 NUM_DIMS = 768 #768 is default, but will automatically change with shape recognition
 MAX_ROWS = 10000 #10k is default, but will automatically change with shape recognition
@@ -30,6 +30,7 @@ PRINT_ORIGINAL = False #prints original input data from file + basic analytics [
 PRINT_QUANT = False #prints quantized and dequantized values at beginning, along with MSE error [default True]
 PRINT_RLE = False #prints the Run Length Encoding compressibility for every tensor [default True]
 PRINT_COMP = True #prints the LZ4 and ZSTD Compression analytics for the bitplanes for every tensor [default True]
+PRINT_EXTRA_SPACE_SAVING_METRICS = False #prints extra metrics (vs Direct Compression, vs Quant+Scale Compressed No BP)
 
 #debug settings
 PRINT_DEBUG = False #prints useful info for debugging
@@ -40,7 +41,7 @@ SHOW_NEGATIVE_COMPRESSION_RATIOS = False
 # - True: will show negative compression ratios (>1.0) [default]
 # - False: will change any negative compression ratios to 1.0
 
-IGNORE_RAW = True
+IGNORE_RAW = False
 #Will skip the raw compression permutations. This saves on performance and VRAM,
 #,especially with large # of rows
 # - True: doesn't perform calculations on Prequantized data [default]
@@ -577,6 +578,9 @@ def run_phased_benchmark(tensor_d, form, variant):
     import numpy
     import lz4.frame
     
+    #clear xpu memory: this is especially important for very large tensors that fill your VRAM
+    torch.xpu.empty_cache()
+    
     #if the original input is not a tensor, convert it to a tensor
     if(torch.is_tensor(tensor_d) == False):
         tensor_d = torch.from_numpy(tensor_d).to(ACCELERATION_DEVICE)
@@ -766,7 +770,7 @@ def run_phased_benchmark(tensor_d, form, variant):
     #print(res)
     return res
 
-def space_saving_metrics(bit_comp_quant, bit_comp_scale, Raw_size):
+def space_saving_metrics(bit_comp_quant, bit_comp_scale, Raw_size, direct_size, direct_quantized_size):
     import pandas as pd
     import numpy as np
     framedata = [[],[],[0,0,0,0,0,0],[0,0,0,0,0,0]]
@@ -797,6 +801,34 @@ def space_saving_metrics(bit_comp_quant, bit_comp_scale, Raw_size):
     #Spatial(LZ4):
     framedata[1].append(round((1-((bit_comp_quant["Spatial(LZ4):"]+bit_comp_scale["Spatial(LZ4):"])/(bit_comp_quant["Original Size(Bits):"]+bit_comp_scale["Original Size(Bits):"])))*100, 3))
     #do the others later
+    #others now are optional, denoted by [0] = -1
+    if(direct_size[0] != -1):
+        #Global(ZSTD):
+        framedata[2][0] = round((1-((bit_comp_quant["Global(ZSTD):"]+bit_comp_scale["Global(ZSTD):"])/direct_size[0]))*100, 3)
+        #Global(LZ4):
+        framedata[2][1] = round((1-((bit_comp_quant["Global(LZ4):"]+bit_comp_scale["Global(LZ4):"])/direct_size[1]))*100, 3)
+        #Temporal(ZSTD):
+        framedata[2][2] = round((1-((bit_comp_quant["Temporal(ZSTD):"]+bit_comp_scale["Temporal(ZSTD):"])/direct_size[0]))*100, 3)
+        #Temporal(LZ4):
+        framedata[2][3] = round((1-((bit_comp_quant["Temporal(LZ4):"]+bit_comp_scale["Temporal(LZ4):"])/direct_size[1]))*100, 3)
+        #Spatial(ZSTD):
+        framedata[2][4] = round((1-((bit_comp_quant["Spatial(ZSTD):"]+bit_comp_scale["Spatial(ZSTD):"])/direct_size[0]))*100, 3)
+        #Spatial(LZ4):
+        framedata[2][5] = round((1-((bit_comp_quant["Spatial(LZ4):"]+bit_comp_scale["Spatial(LZ4):"])/direct_size[1]))*100, 3)
+    if(direct_quantized_size[0] != -1):
+        #Global(ZSTD):
+        framedata[3][0] = round((1-((bit_comp_quant["Global(ZSTD):"]+bit_comp_scale["Global(ZSTD):"])/direct_quantized_size[0]))*100, 3)
+        #Global(LZ4):
+        framedata[3][1] = round((1-((bit_comp_quant["Global(LZ4):"]+bit_comp_scale["Global(LZ4):"])/direct_quantized_size[1]))*100, 3)
+        #Temporal(ZSTD):
+        framedata[3][2] = round((1-((bit_comp_quant["Temporal(ZSTD):"]+bit_comp_scale["Temporal(ZSTD):"])/direct_quantized_size[0]))*100, 3)
+        #Temporal(LZ4):
+        framedata[3][3] = round((1-((bit_comp_quant["Temporal(LZ4):"]+bit_comp_scale["Temporal(LZ4):"])/direct_quantized_size[1]))*100, 3)
+        #Spatial(ZSTD):
+        framedata[3][4] = round((1-((bit_comp_quant["Spatial(ZSTD):"]+bit_comp_scale["Spatial(ZSTD):"])/direct_quantized_size[0]))*100, 3)
+        #Spatial(LZ4):
+        framedata[3][5] = round((1-((bit_comp_quant["Spatial(LZ4):"]+bit_comp_scale["Spatial(LZ4):"])/direct_quantized_size[1]))*100, 3)
+    #now print
     df = pd.DataFrame(np.array(framedata))
     df.columns = ['Global(ZSTD):','Global(LZ4):', 'Temporal(ZSTD):', 'Temporal(LZ4):', 'Spatial(ZSTD):', 'Spatial(LZ4):']
     df.index = ['vs Original Data Size:', 'vs Quantized+Scalar:', 'vs Direct Compression:', 'vs Quant+Scale Compressed (No BP):'] #rows
@@ -804,6 +836,150 @@ def space_saving_metrics(bit_comp_quant, bit_comp_scale, Raw_size):
     pd.set_option('display.width', 150)
     print(df)
     print("\n Extra: Uncompressed Bitplaned Quant+Scalar vs Uncompressed Bitplaned Original Tensor: " + str(round((1-((bit_comp_quant["Original Size(Bits):"]+bit_comp_scale["Original Size(Bits):"])/Raw_size))*100, 3)))
+
+def raw_space_metrics(bit_comp, Raw_size, direct_size):
+    import pandas as pd
+    import numpy as np
+    #note: direct_size is optional, put [-1] if you don't want it to be used
+    # --> direct_size is if you want to compare bitplane compressed size to the direct compressed size
+    
+    framedata = [[]] #set up data
+    #get data
+    #Global(ZSTD):
+    framedata[0].append(round((1-((bit_comp["Global(ZSTD):"])/Raw_size))*100, 3))
+    #Global(LZ4):
+    framedata[0].append(round((1-((bit_comp["Global(LZ4):"])/Raw_size))*100, 3))
+    #Temporal(ZSTD):
+    framedata[0].append(round((1-((bit_comp["Temporal(ZSTD):"])/Raw_size))*100, 3))
+    #Temporal(LZ4):
+    framedata[0].append(round((1-((bit_comp["Temporal(LZ4):"])/Raw_size))*100, 3))
+    #Spatial(ZSTD):
+    framedata[0].append(round((1-((bit_comp["Spatial(ZSTD):"])/Raw_size))*100, 3))
+    #Spatial(LZ4):
+    framedata[0].append(round((1-((bit_comp["Spatial(LZ4):"])/Raw_size))*100, 3))
+    #then print
+    df = pd.DataFrame(np.array(framedata))
+    df.columns = ['Global(ZSTD):','Global(LZ4):', 'Temporal(ZSTD):', 'Temporal(LZ4):', 'Spatial(ZSTD):', 'Spatial(LZ4):']
+    df.index = ['vs Original Data Size:']
+    pd.set_option('display.max_columns', None)
+    pd.set_option('display.width', 150)
+    print(df)
+    
+    #optional direct size too
+    if(direct_size[0] != -1): #note: for this part, you must run direct_compression(tens) before running this function
+        framedata2 = [[]] #set up data
+        #get data
+        #Global(ZSTD):
+        framedata2[0].append(round((1-((bit_comp["Global(ZSTD):"])/direct_size[0]))*100, 3))
+        #Global(LZ4):
+        framedata2[0].append(round((1-((bit_comp["Global(LZ4):"])/direct_size[1]))*100, 3))
+        #Temporal(ZSTD):
+        framedata2[0].append(round((1-((bit_comp["Temporal(ZSTD):"])/direct_size[0]))*100, 3))
+        #Temporal(LZ4):
+        framedata2[0].append(round((1-((bit_comp["Temporal(LZ4):"])/direct_size[1]))*100, 3))
+        #Spatial(ZSTD):
+        framedata2[0].append(round((1-((bit_comp["Spatial(ZSTD):"])/direct_size[0]))*100, 3))
+        #Spatial(LZ4):
+        framedata2[0].append(round((1-((bit_comp["Spatial(LZ4):"])/direct_size[1]))*100, 3))
+        #then print
+        df2 = pd.DataFrame(np.array(framedata2))
+        df2.columns = ['Global(ZSTD):','Global(LZ4):', 'Temporal(ZSTD):', 'Temporal(LZ4):', 'Spatial(ZSTD):', 'Spatial(LZ4):']
+        df2.index = ['vs Direct [ZSTD,LZ4]:']
+        print(df2)
+
+def direct_compression(tens):
+    import zstandard as zstd
+    import numpy as np
+    import lz4.frame
+    import torch
+    
+    if(torch.is_tensor(tens) == False):
+        tens = torch.from_numpy(tens).to(ACCELERATION_DEVICE)
+    
+    #get the raw bytes
+    rawbytes = tens.cpu().numpy().tobytes()
+    
+    #do zstd compression first
+    c_z = zstd.ZstdCompressor(level=3)
+    zstd_size = 0 #in bytes
+    for i in range(0, len(rawbytes), BLOCK_SIZE):
+        block = rawbytes[i : i + BLOCK_SIZE]
+        #handle with zero padding if needed
+        if(len(block) < BLOCK_SIZE):
+            block = block.ljust(BLOCK_SIZE, b'\x00')
+        
+        zstd_size += len(c_z.compress(block))
+    direc_ratio_z = round(float(zstd_size/len(rawbytes)), 3)
+    direc_perc_z = round((1-(zstd_size/len(rawbytes)))*100, 3)
+    if(SHOW_NEGATIVE_COMPRESSION_RATIOS == False):
+        direc_ratio_z = direc_ratio_z if direc_ratio_z < 1.000 else 1.000
+        direc_perc_z = direc_perc_z if direc_perc_z >= 0.000 else 0.000
+    print("\nDirect Compression(ZSTD) Ratio & % Memory Saving: " + str(direc_ratio_z) + " , " + str(direc_perc_z) + "%")
+    zstd_bits = zstd_size * 8 #size of zstd compressed in bits
+    
+    #then, do lz4 compression
+    lz4_size = len(lz4.frame.compress(rawbytes, block_size=BLOCK_SIZE)) #in bytes
+    direc_ratio_l = round(float(lz4_size/len(rawbytes)), 3)
+    direc_perc_l = round((1-(lz4_size/len(rawbytes)))*100, 3)
+    if(SHOW_NEGATIVE_COMPRESSION_RATIOS == False):
+        direc_ratio_l = direc_ratio_l if direc_ratio_l < 1.000 else 1.000
+        direc_perc_l = direc_perc_l if direc_perc_l >= 0.000 else 0.000
+    print("\nDirect Compression(LZ4) Ratio & % Memory Saving: " + str(direc_ratio_l) + " , " + str(direc_perc_l) + "%")
+    lz4_bits = lz4_size * 8 #in bits
+    
+    return zstd_bits, lz4_bits
+
+def direct_quantized_compression(quant, scale):
+    import zstandard as zstd
+    import numpy as np
+    import lz4.frame
+    import torch
+    
+    if(torch.is_tensor(quant) == False):
+        quant = torch.from_numpy(quant).to(ACCELERATION_DEVICE)
+    if(torch.is_tensor(scale) == False):
+        scale = torch.from_numpy(scale).to(ACCELERATION_DEVICE)
+    
+    #get the raw bytes
+    rawbytes_q = quant.cpu().numpy().tobytes()
+    rawbytes_s = scale.cpu().numpy().tobytes()
+    
+    #do zstd compression first
+    c_z = zstd.ZstdCompressor(level=3)
+    zstd_size = 0 #in bytes
+    for i in range(0, len(rawbytes_q), BLOCK_SIZE):
+        block = rawbytes_q[i : i + BLOCK_SIZE]
+        #handle with zero padding if needed
+        if(len(block) < BLOCK_SIZE):
+            block = block.ljust(BLOCK_SIZE, b'\x00')
+        
+        zstd_size += len(c_z.compress(block))
+    for i in range(0, len(rawbytes_s), BLOCK_SIZE):
+        block = rawbytes_s[i : i + BLOCK_SIZE]
+        #handle with zero padding if needed
+        if(len(block) < BLOCK_SIZE):
+            block = block.ljust(BLOCK_SIZE, b'\x00')
+        
+        zstd_size += len(c_z.compress(block))
+    direc_ratio_z = round(float(zstd_size/(len(rawbytes_q)+len(rawbytes_s))), 3)
+    direc_perc_z = round((1-(zstd_size/(len(rawbytes_q)+len(rawbytes_s))))*100, 3)
+    if(SHOW_NEGATIVE_COMPRESSION_RATIOS == False):
+        direc_ratio_z = direc_ratio_z if direc_ratio_z < 1.000 else 1.000
+        direc_perc_z = direc_perc_z if direc_perc_z >= 0.000 else 0.000
+    print("\nDirect Compression(ZSTD, Quant+Scale) Ratio & % Memory Saving: " + str(direc_ratio_z) + " , " + str(direc_perc_z) + "%")
+    zstd_bits = zstd_size * 8 #size of zstd compressed in bits
+    
+    #then, do lz4 compression
+    lz4_size = len(lz4.frame.compress(rawbytes_q, block_size=BLOCK_SIZE)) + len(lz4.frame.compress(rawbytes_s, block_size=BLOCK_SIZE)) #in bytes
+    direc_ratio_l = round(float(lz4_size/(len(rawbytes_q)+len(rawbytes_s))), 3)
+    direc_perc_l = round((1-(lz4_size/(len(rawbytes_q)+len(rawbytes_s))))*100, 3)
+    if(SHOW_NEGATIVE_COMPRESSION_RATIOS == False):
+        direc_ratio_l = direc_ratio_l if direc_ratio_l < 1.000 else 1.000
+        direc_perc_l = direc_perc_l if direc_perc_l >= 0.000 else 0.000
+    print("\nDirect Compression(LZ4, Quant+Scale) Ratio & % Memory Saving: " + str(direc_ratio_l) + " , " + str(direc_perc_l) + "%")
+    lz4_bits = lz4_size * 8 #in bits
+    
+    return zstd_bits, lz4_bits
 
 def check_tensor_entropy(tensor_d):
     import torch
@@ -1098,26 +1274,41 @@ def initialization():
         bit_rep += torch.iinfo(tens_emb.dtype).bits
     raw_size = tens_emb.shape[0] * tens_emb.shape[1] * bit_rep #full raw size of original tensor in bits
     #now, for space-saving-metrics
+    direct_row = [-1,-1]
+    direct_col = [-1,-1]
+    direct_sizes = [-1,-1]
+    
+    if(PRINT_EXTRA_SPACE_SAVING_METRICS == True):
+        print("\nDirect Compression Metrics for Quant+Scalar Row-wise: ")
+        direct_row = direct_quantized_compression(row_quant_raw, row_scale_raw)
+        print("\nDirect Compression Metrics for Quant+Scalar Column-wise: ")
+        direct_col = direct_quantized_compression(col_quant_raw, col_scale_raw)
+    
+    if(IGNORE_RAW == False):
+        print("\nSpace Saving Metric: Direct Raw Compression (No bitplaning) vs Original Raw: ")
+        direct_sizes = direct_compression(tens_emb)
+        
+        print("\nSpace Saving Metrics: Vertical (Raw): ")
+        raw_space_metrics(comp_vertical_bitplane_raw, raw_size, direct_sizes)
+        #space_saving_metrics(comp_vertical_bitplane_raw, comp_vertical_bitplane_raw, raw_size) #for vertical_raw
+    
+        print("\nSpace Saving Metrics: Horizontal (Raw): ")
+        raw_space_metrics(comp_horizontal_bitplane_raw, raw_size, direct_sizes)
+        #space_saving_metrics(comp_horizontal_bitplane_raw, comp_horizontal_bitplane_raw, raw_size) #for horizontal_raw
+    
     if(SHOW_EXTRANEOUS_RESULTS == True):
         print("\nSpace Saving Metrics: Horizontal_Row (Quant+Scale): ")
-        space_saving_metrics(comp_horizontal_bitplane_quant_row, comp_horizontal_bitplane_scale_row, raw_size) #for horizontal_row
+        space_saving_metrics(comp_horizontal_bitplane_quant_row, comp_horizontal_bitplane_scale_row, raw_size, direct_sizes, direct_row) #for horizontal_row
     
     print("\nSpace Saving Metrics: Vertical_Row (Quant+Scale): ")
-    space_saving_metrics(comp_vertical_bitplane_quant_row, comp_vertical_bitplane_scale_row, raw_size) #for vertical_row (most promising, across all vector embeddings)
+    space_saving_metrics(comp_vertical_bitplane_quant_row, comp_vertical_bitplane_scale_row, raw_size, direct_sizes, direct_row) #for vertical_row (most promising, across all vector embeddings)
     
     print("\nSpace Saving Metrics: Horizontal_Col (Quant+Scale): ")
-    space_saving_metrics(comp_horizontal_bitplane_quant_col, comp_horizontal_bitplane_scale_col, raw_size) #for horizontal_col (less promising, across each vector embedding for all vector embeddings)
+    space_saving_metrics(comp_horizontal_bitplane_quant_col, comp_horizontal_bitplane_scale_col, raw_size, direct_sizes, direct_col) #for horizontal_col (less promising, across each vector embedding for all vector embeddings)
     
     if(SHOW_EXTRANEOUS_RESULTS == True):
         print("\nSpace Saving Metrics: Vertical_Col (Quant+Scale): ")
-        space_saving_metrics(comp_vertical_bitplane_quant_col, comp_vertical_bitplane_scale_col, raw_size) #for vertical_col
-    
-    if(IGNORE_RAW == False):
-        print("\nSpace Saving Metrics: Vertical (Raw): ")
-        space_saving_metrics(comp_vertical_bitplane_raw, comp_vertical_bitplane_raw, raw_size) #for vertical_raw
-    
-        print("\nSpace Saving Metrics: Horizontal (Raw): ")
-        space_saving_metrics(comp_horizontal_bitplane_raw, comp_horizontal_bitplane_raw, raw_size) #for horizontal_raw
+        space_saving_metrics(comp_vertical_bitplane_quant_col, comp_vertical_bitplane_scale_col, raw_size, direct_sizes, direct_col) #for vertical_col
     
 if __name__ == '__main__':
     initialization() #call it, starts the simulation
