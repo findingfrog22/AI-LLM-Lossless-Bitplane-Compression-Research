@@ -1,14 +1,16 @@
 Our next task is to work on the overall simulation, we need code that can handle vector embeddings and data from different file types, sources, and formats
-to do 3/14+/26: (B0.9.0)
-- more metrics:
---> Direct file compression
---> metric: vs Direct Compression
---> metric: vs Quant+Scale Compressed (No Bitplaning)
---> (optional) avg compression ratio for global, temporal, spatial (for each LZ4 and ZSTD) [averages across all bitplanes]
---> (optional) actual compression ratio for global, temporal, spatial (for each LZ4 and ZSTD) [gets sizes of all compressed bitplanes, adds it up, divides by total quantized size of before compression]
---> (optional) The previous 2 metrics, but with scalar + quantized
---> (optional) The previous 2 metrics, but compared to pre-quantized tensor
---> (optional) Raw/Direct versions of these metrics
+to do 3/16+/26: (B0.9.8)
+- Add block row randomization support (random starting row #)(+settings)
+- Test on more types of files (+new datasets support)(add more file support than just .parquet and .npy)
+
+Future roadmap: 
+- B0.9.9:
+--> Test for Nvidia CUDA support
+--> Test for AMD ROCm support
+--> Optionally test CPU fallback support
+- R1.0.0 - Full Release:
+--> Clean up code, comments, and documentation
+--> Take new documentation in new document. Make as clean and understandable as possible
 
 to do from meeting 4:
 - wants histogram distribution of input vector embedding data. is the values between 0 and 1? -1 and 1? etc
@@ -19,7 +21,6 @@ to do from meeting 4:
 
 Some of the lower priority tasks:
  - adding explantions
- - direct compression
  - adding options for randomized file selection
  - adding options for randomized starting row selection
  - [basically done?, only tested working on .parquet and .npy, havent tested uncompressed jsonl or csv yet] Finish working on the vector embedding extraction (heuristic?) [NOTE: don't do jsonl.zst stuff, Rui said]
