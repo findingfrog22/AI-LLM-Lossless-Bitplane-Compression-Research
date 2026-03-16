@@ -1,0 +1,10 @@
+To do 3_17+_26: (A0.4.0 - Early Alpha)
+- Fix the compression overhead (something seems wrong about it)
+- Check the entropy of each row
+- check for any overhead (it seems your custom 4096 dim vector embeddings get bit packed to 512 bytes, which is too small for LZ4 and ZSTD to compress effectively)
+- New changes that must be made to get closer to the TRACE research paper:
+--> Delta Transformation (on both quantized and unquantized)
+--> Block row concatenation (ex, if you dim is 4096, but gets packed to 512, then you need to concatenate 8 of those 512 byte rows, then compress that)
+--> Maybe only analyze MSBS (and for floating point, only analyze sign and exponent?)
+
+currently writing new rewrite of simulation called FinalSimulation.py
