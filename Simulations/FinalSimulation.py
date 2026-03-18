@@ -17,7 +17,10 @@ QUANTIZATION_TYPE = torch.int8 #You change this value, this is the resulting qua
 SCALE_TYPE = torch.float32 #torch.float32 is detault, will autochange during quantization
 
 #some LZ4 and ZSTD Compression Settings
-BLOCK_SIZE = 512 #default - 4096 = 4KB
+BLOCK_SIZE = 4096 #default - 4096 = 4KB
+#Note: make sure that this BLOCK_SIZE divides evenly into (QuantTypeBits * NUM_DIMS)/8 (this is the Byte size per row)
+#, or else it will zero pad at the end and slightly throw off your results
+#Note: Also make sure that your BLOCK_SIZE <= (NUM_DIMS * QuantTypeBits)/8, or else your compression ratios are negative
 
 #performance settings
 ACCELERATION_DEVICE = "xpu" #"xpu" is default
@@ -32,6 +35,8 @@ PRINT_QUANT = True #prints quantized and dequantized values at beginning, along 
 PRINT_RLE = False #prints the Run Length Encoding compressibility for every tensor [default False]
 PRINT_COMP = True #prints the LZ4 and ZSTD Compression analytics for the bitplanes for every tensor [default True]
 PRINT_EXTRA_SPACE_SAVING_METRICS = False #prints extra metrics (vs Direct Compression, vs Quant+Scale Compressed No BP) [default False]
+
+PRINT_DELTA_TRANSFORMATION = False #prints version with delta transformation (optional due to diminishing returns) [default False]
 
 #debug settings
 PRINT_DEBUG = False #prints useful info for debugging [default False]
@@ -501,7 +506,9 @@ def zstd_compress_list(data_list): #takes in a list
         if(len(block) < BLOCK_SIZE):
             #print("BLOCK: " + str(len(block)) + " : " + str(BLOCK_SIZE))
             block = block.ljust(BLOCK_SIZE, b'\x00')
+        #print("Before Size: " + str(len(block)))
         compressed_size += len(c.compress(block))
+        #print("After Size: " + str(len(c.compress(block))))
     
     return compressed_size
     #return len(c.compress(group))
@@ -560,15 +567,61 @@ def bitplane_compression_benchmark(tensor_d, title): #repolaces run_phased_bench
     orig_size_kb = (N * W) / (1024 * 8) #gets it in bytes becuase the compressors return size in bytes
     print("B: " + str(B))
     B_b = B
+    concat = {n: {"Vector Embedding": n} for n in range(N)}
     metrics = {n: {"Vector Embedding": n} for n in range(N)}
     results = {k: {"Bitplane": k} for k in range(B_b)} #setting up the title
     cores = min(B_b+1, multiprocessing.cpu_count()) #add an extra core for the loops?
     #cores = multiprocessing.cpu_count() #just use ALL of the cores this time
     check_tensor_entropy(tensor_d)
+    #lets try the most important one first, concat
+    with multiprocessing.Pool(processes=min(N, multiprocessing.cpu_count())) as p:
+        #set up the data
+        temp = packed.contiguous().cpu().numpy()
+        #set up the tasks
+        concat_tasks = [[temp[n].tobytes()] for n in range(N)]
+        #perform the compression
+        concat_zstd_sizes = p.map(zstd_compress_list, concat_tasks)
+        concat_lz4_sizes = p.map(lz4_compress_list, concat_tasks)
+        #get the % savings
+        if(SHOW_NEGATIVE_COMPRESSION_RATIOS == False):
+            for n in range(N):
+                concat[n]["Concatenated % Savings (ZSTD):"] = max(round((1-(concat_zstd_sizes[n]/((W*B_b)/8)))*100, 3), 0.000)
+                concat[n]["Concatenated % Savings (LZ4):"] = max(round((1-(concat_lz4_sizes[n]/((W*B_b)/8)))*100, 3), 0.000)
+        else:
+            for n in range(N):
+                concat[n]["Concatenated % Savings (ZSTD):"] = round((1-(concat_zstd_sizes[n]/((W*B_b)/8)))*100, 3)
+                concat[n]["Concatenated % Savings (LZ4):"] = round((1-(concat_lz4_sizes[n]/((W*B_b)/8)))*100, 3)
+        #now get the overall % savings per LZ4 and ZSTD
+        concat_zstd_bytes = sum(concat_zstd_sizes)
+        concat_lz4_bytes = sum(concat_lz4_sizes)
+        total_size_bytes = (N * B * W)/8
+        if(SHOW_NEGATIVE_COMPRESSION_RATIOS == False):
+            concat_perc_saving_zstd = max(round((1 - (concat_zstd_bytes/total_size_bytes))*100, 3), 0.000)
+            concat_perc_saving_lz4 = max(round((1 - (concat_lz4_bytes/total_size_bytes))*100, 3), 0.000)
+        else:
+            concat_perc_saving_zstd = max(round((1 - (concat_zstd_bytes/total_size_bytes))*100, 3), 0.000)
+            concat_perc_saving_lz4 = max(round((1 - (concat_lz4_bytes/total_size_bytes))*100, 3), 0.000)
+        #get the average too
+        concat_zstd_s = [concat[n]["Concatenated % Savings (ZSTD):"] for n in range(N)]
+        concat_lz4_s = [concat[n]["Concatenated % Savings (LZ4):"] for n in range(N)]
+        concat_zstd_avg = float(sum(concat_zstd_s) / N)
+        concat_lz4_avg = float(sum(concat_lz4_s) / N)
+    
+    #print concat metrics
+    df1 = pd.DataFrame(list(concat.values())).sort_values("Vector Embedding", ascending=False)
+    pd.set_option('display.max_columns', None)
+    pd.set_option('display.width', 150)
+    print(df1)
+    print("Concat % Saving Overall (ZSTD): " + str(concat_perc_saving_zstd) + ", Average: " + str(concat_zstd_avg))
+    print("Concat % Saving Overall (LZ4): " + str(concat_perc_saving_lz4) + ", Average: " + str(concat_lz4_avg))
+    print((W * B_b)/8)
+        
     with multiprocessing.Pool(processes=cores) as pool: #will come back to this later. will need to change a bunch of stuff, add new metrics too
         #try it by row first
+        
         temp = packed.contiguous().cpu().numpy()
         tasks = list()
+        
         for n in range(N):
             bitplanetasks = [[temp[n][b].tobytes()] for b in range(B_b)]
             z_tsizes = pool.map(zstd_compress_list, bitplanetasks)
@@ -579,9 +632,11 @@ def bitplane_compression_benchmark(tensor_d, title): #repolaces run_phased_bench
             else:
                 z_ratios = [round(z/(W/8), 3) for z in z_tsizes]
                 l_ratios = [round(l/(W/8), 3) for l in l_tsizes]
+                
             metrics[n]["Bit Plane Ratios (ZSTD):"] = z_ratios
             metrics[n]["Bit Plane Ratios (LZ4):"] = l_ratios
-        #then overall
+        
+        '''
         #packed_b (packs across w)
         b_temporal = packed.permute(1,0,2).contiguous().cpu().numpy()
         temporaltasks = list()
@@ -607,13 +662,14 @@ def bitplane_compression_benchmark(tensor_d, title): #repolaces run_phased_bench
                 #add to the return results too
                 #res["Spatial(ZSTD):"] += z_tsizes*8
                 #res["Spatial(LZ4):"] += l_tsizes*8
-                
+    '''
     #now, print and return the results
+    
     df0 = pd.DataFrame(list(metrics.values())).sort_values("Vector Embedding", ascending=False)
-    df = pd.DataFrame(list(results.values())).sort_values("Bitplane", ascending=False)
-    pd.set_option('display.max_columns', None)
-    pd.set_option('display.width', 150)
-    print(df)
+    #df = pd.DataFrame(list(results.values())).sort_values("Bitplane", ascending=False)
+    #pd.set_option('display.max_columns', None)
+    #pd.set_option('display.width', 150)
+    #print(df)
     print(df0)
 
 #added some new features, like showing negative compression ratios or now
@@ -1225,6 +1281,13 @@ def run_simulation():
     #stage 5+6: bitpacking (horizontally, packed_b) + LZ4 & ZSTD Bitplane compression (with metrics)
     print("\nSTAGE 5+6: Bitpacking + LZ4 & ZSTD Compression: ")
     bitplane_compression_benchmark(quantized_bitplane, "bitplane quant horizontal")
+    #I want to test delta transformation too
+    #it gives ~1% improvement, which is not good becuase it introduces computational complexity which hurts latency
+    if(PRINT_DELTA_TRANSFORMATION == True):
+        tensor_delta = quantized_bitplane.clone()
+        tensor_delta[:, 1:] = quantized_bitplane[:, 1:] - quantized_bitplane[:, :-1]
+        bitplane_compression_benchmark(tensor_delta, "delta transformation - horizontal")
+    
     #entropy
     entropy_results = calculate_shannon_entropy_per_row(quantized_bitplane)
     # Print average for each bitplane to the console
@@ -1241,10 +1304,4 @@ if  __name__ == "__main__":
     
     #then call simulation
     run_simulation()
-    
-    #parquet_data = [[0.5,0.33,0.125],[0.75,0.25,0.375]] #tensor is (N,W), (in this case, (2,3))
-    #parquet_data = [[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0]] #tensor is (N,W), (in this case, (8,8))
-    #parquet_data = [[0.5,0.0625,0.4375,0.953125,0.125,0.5625,0.875,0.75],[0.25,0.09375,0.5,0.4375,0.75,0.6875,0.75,0.4375],[0.75,0.4375,0.9375,0.1875,0.66,0.75,0.5,0.33],[0.66,0.84375,0.90625,0.33,0.625,0.8125,0.8125,0.9375],[0.375,0.5625,0.984375,0.7578125,0.25,0.625,0.4375,0.75],[0.625,0.625,0.8125,0.9375,0.5,0.66,0.8125,0.5],[0.125,0.875,0.5703125,0.78125,0.75,0.375,0.90625,0.625],[0.33,0.3125,0.7578125,0.3359375,0.8125,0.8125,0.7734375,0.375]] #tensor is (N,W), (in this case, (8,8))
-    #Tensor = torch.tensor(parquet_data, dtype=torch.float32)
-    #print(format("032b", Tensor.view(torch.uint32)))
     
