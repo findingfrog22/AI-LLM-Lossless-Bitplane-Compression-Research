@@ -53,7 +53,6 @@ IGNORE_RAW = True
 # - True: doesn't perform calculations on Prequantized data [default]
 # - False: performs calculations on prequantized data [warning, performance may drop]
 
-
 #Step -1: vector embedding generation
 
 #Step 0: Vector embedding file handling
@@ -84,12 +83,101 @@ def _find_vector_column(sample_row):
             
     raise ValueError("Could not automatically detect a vector column.")
 
+def generate_local_embeddings(text, model_name):
+    import os
+    import json
+    import io
+    import numpy as np
+    import pandas as pd
+    import zstandard as zstd
+    from pathlib import Path
+    import sentence_transformers
+    """Checks local 'models' folder, downloads if missing, and runs inference."""
+    script_dir = Path(__file__).parent.resolve()
+    model_dir = script_dir / "models"
+    model_dir.mkdir(exist_ok=True)
+
+    # GGUF MODELS (Llama-cpp-python)
+    if model_name in ["qwen3", "e5-mistral", "nomic"]:
+        from llama_cpp import Llama
+        from huggingface_hub import hf_hub_download
+        
+        configs = {
+            "qwen3": ("Qwen/Qwen3-Embedding-8B-GGUF", "Qwen3-Embedding-8B-f16.gguf"),
+            "e5-mistral": ("dranger003/e5-mistral-7b-instruct-GGUF", "ggml-e5-mistral-7b-instruct-f16.gguf"),
+            "nomic": ("nomic-ai/nomic-embed-text-v1.5-GGUF", "nomic-embed-text-v1.5.f32.gguf")
+        }
+        #original e5-mistral: ("intfloat/e5-mistral-7b-instruct", "e5-mistral-7b-instruct-f16.gguf")
+        repo, filename = configs[model_name]
+        m_path = hf_hub_download(repo_id=repo, filename=filename, local_dir=str(model_dir))
+        
+        engine = Llama(model_path=m_path, embedding=True, pooling_type=0, n_gpu_layers=-1, n_ctx=32768, verbose=False)
+        return np.array(engine.create_embedding(text)['data'][0]['embedding'])
+
+    # TRANSFORMERS MODELS (Sentence-Transformers)
+    elif model_name in ["bge-m3", "e5-large-v2"]:
+        from sentence_transformers import SentenceTransformer
+        hf_id = {"bge-m3": "BAAI/bge-m3", "e5-large-v2": "intfloat/e5-large-v2"}[model_name]
+        # SentenceTransformer handles local caching automatically
+        model = SentenceTransformer(hf_id, cache_folder=str(model_dir))
+        inputs = model.tokenize([text])
+        device = next(model.parameters()).device
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        with torch.no_grad():
+            output = model[0](inputs)
+            raw_matrix = output['token_embeddings']
+        return np.array(raw_matrix[0].to("cpu"))
+
+    #note: these others below are not going to be used
+    # API MODELS
+    elif model_name == "openai-3-large":
+        from openai import OpenAI
+        client = OpenAI()
+        return np.array(client.embeddings.create(input=text, model="text-embedding-3-large").data[0].embedding)
+    
+    # 4. GOOGLE GEMINI (API-based)
+    elif model_name == "gemini-2":
+        import google.generativeai as genai
+        # Requires GOOGLE_API_KEY env variable
+        genai.configure(api_key=os.environ["GOOGLE_API_KEY"])
+        # 'models/text-embedding-004' or the new 'gemini-embedding-2-preview'
+        result = genai.embed_content(
+            model="models/gemini-embedding-2-preview",
+            content=text,
+            task_type="retrieval_document"
+        )
+        return np.array(result['embedding'])
+
+    # 5. NVIDIA NV-EMBED (Local via Transformers or NIM API)
+    elif model_name == "nv-embed-v2":
+        # Strategy A: Using NVIDIA's API (NIM)
+        from openai import OpenAI # NVIDIA NIM uses OpenAI-compatible headers
+        client = OpenAI(
+            base_url="https://integrate.api.nvidia.com/v1",
+            api_key=os.environ["NVIDIA_API_KEY"]
+        )
+        response = client.embeddings.create(
+            input=[text],
+            model="nvidia/nv-embed-v2"
+        )
+        return np.array(response.data[0].embedding)
+
+    # 6. NVIDIA NEMOTRON (Local via Sentence-Transformers)
+    elif model_name == "nemotron-embed":
+        from sentence_transformers import SentenceTransformer
+        # These are often hosted on HF as 'nvidia/llama-nemotron-embed-1b-v2'
+        model = SentenceTransformer("nvidia/llama-nemotron-embed-1b-v2", cache_folder=str(model_dir))
+        return model.encode(text)
+    pass
+
 def extract_vectors(file_path, vector_column_name='embeddings'):
     import os
     import numpy as np
     import pandas as pd
     import json
     import zstandard as zstd
+    import ml_dtypes
+    import pyarrow.feather as feather
     """
     Extracts vector data from various file formats and returns a NumPy array.
     """
@@ -156,22 +244,26 @@ def extract_vectors(file_path, vector_column_name='embeddings'):
             return np.array(vectors)
 
         # 4. CSV Files (Text-heavy/Debug formats)
-        elif ext == '.csv':
+        elif ext == '.csv': #don't use this either
             df = pd.read_csv(file_path)
             # CSV vectors are often stored as strings like "[0.1, 0.2...]"
             # This converts those strings back into actual lists/arrays
-            print("CSV KEYS: ")
-            print(df.keys())
-            if isinstance(df[vector_column_name].iloc[0], str):
-                df[vector_column_name] = df[vector_column_name].apply(lambda x: json.loads(x))
-            return np.stack(df[vector_column_name].values)
+            print([df.iloc[i] for i in range(8)])
+            key = _find_vector_column(df.iloc[0])
+            #print("CSV KEYS: ")
+            #print(df.keys())
+            if isinstance(df[key].iloc[0], str):
+                df[key] = df[key].apply(json.loads)
+            return np.stack(df[key].values)
 
         # 5. SafeTensors (Modern Model Weights)
-        elif ext == '.safetensors':
+        elif ext == '.safetensors': #don't use this at all. It is more for model weights than vector embeddings
             from safetensors.numpy import load_file
             tensors = load_file(file_path)
             # Safetensors usually have multiple keys; we return the first one or a specific one
-            key = list(tensors.keys())[0]
+            #key = list(tensors.keys())[0]
+            print(tensors)
+            key = _find_vector_column(tensors)
             print(f"Extracted key: {key}")
             return tensors[key]
 
@@ -185,76 +277,27 @@ def extract_vectors(file_path, vector_column_name='embeddings'):
         
         # 7. .txt (Create the vector embedding yourself)
         elif ext == '.txt':
-            import os
-            import numpy as np
-            from pathlib import Path
-            from huggingface_hub import hf_hub_download
-            from llama_cpp import Llama
-            from transformers import AutoModel, AutoTokenizer
-            import torch
-            import accelerate
-            
-            repository_id = "Qwen/Qwen3-Embedding-8B-GGUF"
-            filename = "Qwen3-Embedding-8B-f16.gguf"
-            current_directory = Path(__file__).parent.resolve()
-            model_dir = current_directory / "models"
-            #get uncompressed_embeddings
-            model_dir.mkdir(parents=True, exist_ok=True)
-            #check for file or download
-            #only downloads a single 16gb file
-            model_path = hf_hub_download(repo_id=repository_id, filename=filename, local_dir=str(model_dir))
-            #initialize the engine
-            engine = Llama(model_path=model_path, embedding=True, n_gpu_layers=-1, n_ctx=32768, n_batch=1024, pooling_type=0, verbose=False)
-            #NOTE: n_ctx means how much memory you need for context
-            #NOTE: n_batch probably means how many tokens it can batch together
-            #NOTE: pooling_type=2 means that it does last token pooling (normal for Qwen3 embedding), and =0 means it gets a vector for every token
-            
-            #generate the 4096+ dim vector
-            #text = "".join(open(file_path, 'r'))
             text = open(file_path, 'r', encoding='utf-8').read()
-            tokens = engine.tokenize(text.encode('utf-8'))
-            #with text as f:
-                #lines = [line.strip() for line in f if line.strip()]
-            #output = engine.create_embedding(lines)
-            #vectors = [item['embedding'] for item in output['data']]
-            #return np.array(vectors)
-            #if(len(tokens) > 32768):
-                #print("Failure")
-            result = np.array(engine.create_embedding(text)['data'][0]['embedding'])
-            print("ORIGINAL .TXT VECTOR EMBEDDING DATA: " + str(result.shape))
-            print(result)
-            return result
-            #print(output)
-            #raw_vector = np.array(output['data'][0]['embedding'])
-            #return raw_vector
-            '''
-            current_directory = Path(__file__).parent.resolve()
-            #load uncompressed_engine
-            model_id = "Qwen/Qwen3-Embedding-8B"
-            model_path = current_directory/"models"/"qwen3-8b-f16"
-            #download fp16 safetensors
-            tokenizer = AutoTokenizer.from_pretrained(model_id, cache_dir=model_path)
-            model = AutoModel.from_pretrained(model_id, dtype=torch.float16, device_map=ACCELERATION_DEVICE, cache_dir=model_path, trust_remote_code=True)
-            #now text and stuff
-            text = "".join(open(file_path, 'r'))
-            inputs = tokenizer(text, return_tensors="pt").to(model.device)
-            with torch.no_grad():
-                outputs = model(**inputs, output_hidden_states=True)
-                #extract hidden state of the last token from the last layer
-                last_hidden_state = outputs.last_hidden_state[0, -1, :]
-            #convert to CPU/Numpy for your custom quantization logic
-            return last_hidden_state.cpu().numpy()
-            '''
-            '''
-            #initialize model
-            model = Llama(model_path="./Embedding_Models/Qwen3-Embedding-8B-f16.gguf", embedding=True, n_gpu_layers=-1)
-            #generate the 4096+ dim embedding
-            text = "".join(open(file_path, 'r'))
-            output = model.create_embedding(text)
-            #extract the tensor
-            print("Dim of custom embedding: " + str(len(output['data'][0]['embedding'])))
-            return output['data'][0]['embedding']
-            '''
+            #print(text)
+            framedata = [[4096, 40960, "Alibaba Group", "Quite advanced"],[3072, 8192, "OpenAI", "Used in ChatGPT"],[4096, 32768, "Microsoft", "Used in Bing Search, and Even Copilot and RAG applications"],[1024, 512, "Microsoft", "Warning: pretty low token range"],[1024, 8192, "Beijing Academy of Artificial Intelligence", ""],[768,8192, "Nomic AI", "new, and focused on performance"],[4096,32768, "Nvidia", "Based on E5 Mistral 7B, optimized for performance and accuracy. Typically used in research rather than industry."],[2048,8192, "Nvidia", "Custom Nemotron architecture, good for efficiency"],[3072,8192, "Google", "Used in Google Gemini Models."]]
+            df = pd.DataFrame(np.array(framedata))
+            df.columns = ['Maximum Dims:','Maximum # Tokens:', 'Source:', 'Notes:']
+            df.index = ['0.) Qwen3 Embedding 8B FP16: ', '1.) OpenAI V3 Large: ', '2.) E5 Mistral 7B FP16: ', '3.) E5 Large V2: ', '4.) BAAI BGE-M3: ', '5.) Nomic Embed V1.5 FP32: ', '6.) NV-Embed V2: ', '7.) Llama Nemotron Embedding 1B: ', '8.) Gemini Embedding 2'] #rows
+            pd.set_option('display.max_columns', None)
+            pd.set_option('display.width', 150)
+            print(df)
+            print("NOTE: These embedding models won't work properly, due to either being paid, requiring API keys, or not running locally:")
+            print("1.) OpenAI V3 Large\n6.) NV-Embed V2\n7.) Llama Nemotron Embedding 1B\n8.) Gemini Embedding 2\n")
+            choice = int(input("Enter your number choice here: "))
+            
+            options = ["qwen3","openai-3-large","e5-mistral","e5-large-v2","bge-m3","nomic","nv-embed-v2","nemotron-embed","gemini-2"]
+            return generate_local_embeddings(text, options[choice])
+        
+        # 8. .arrow or .feather; extremelly rare, but huggingface datasets sometimes use this
+        elif ext == '.arrow' or ext == '.feather':
+            df = feather.read_feather(file_path)
+            key = _find_vector_column(df.iloc[0])
+            return np.stack(df[key].values)
 
         else:
             print(f"Unsupported extension: {ext}")
@@ -352,12 +395,15 @@ def Symmetric_Scalar_Error(orig, dequant):
 def direct_bitplane(tens_emb): #replaces the older version
     import torch
     tens_bits = tens_emb.element_size() * 8
+    #print("TENS BITS___________: " + str(tens_bits))
     if(tens_bits == 32):
         view_type = torch.int32
     elif(tens_bits == 8):
         view_type = torch.int8
     elif(tens_bits == 16):
         view_type = torch.int16
+    elif(tens_bits == 64):
+        view_type = torch.int64
     else:
         view_type = torch.int32 #default fallback
     
@@ -386,6 +432,8 @@ def bitplane(quant, scale): #FIXED
             view_type = torch.int8
         elif num_bits == 16:
             view_type = torch.int16
+        elif num_bits == 64:
+            view_type = torch.int64
         else:
             view_type = torch.int32 # Default fallback
         
@@ -541,7 +589,7 @@ def calculate_shannon_entropy_per_row(bit_tensor):
     #print(h)
     return h # Returns (N, B) matrix
 
-def bitplane_compression_benchmark(tensor_d, title): #repolaces run_phased_benchmark
+def bitplane_compression_benchmark(tensor_d, title): #replaces run_phased_benchmark
     import torch
     import multiprocessing
     import zstandard as zstd
@@ -570,6 +618,7 @@ def bitplane_compression_benchmark(tensor_d, title): #repolaces run_phased_bench
     concat = {n: {"Vector Embedding": n} for n in range(N)}
     metrics = {n: {"Vector Embedding": n} for n in range(N)}
     results = {k: {"Bitplane": k} for k in range(B_b)} #setting up the title
+    ret = {"Concatenated Bits (ZSTD):": 0, "Concatenated Bits (LZ4):": 0, "Original Quantized Bits:": 0}
     cores = min(B_b+1, multiprocessing.cpu_count()) #add an extra core for the loops?
     #cores = multiprocessing.cpu_count() #just use ALL of the cores this time
     check_tensor_entropy(tensor_d)
@@ -595,12 +644,17 @@ def bitplane_compression_benchmark(tensor_d, title): #repolaces run_phased_bench
         concat_zstd_bytes = sum(concat_zstd_sizes)
         concat_lz4_bytes = sum(concat_lz4_sizes)
         total_size_bytes = (N * B * W)/8
+        ret["Original Quantized Bits:"] = total_size_bytes*8
         if(SHOW_NEGATIVE_COMPRESSION_RATIOS == False):
             concat_perc_saving_zstd = max(round((1 - (concat_zstd_bytes/total_size_bytes))*100, 3), 0.000)
             concat_perc_saving_lz4 = max(round((1 - (concat_lz4_bytes/total_size_bytes))*100, 3), 0.000)
+            ret["Concatenated Bits (ZSTD):"] = min(concat_zstd_bytes, total_size_bytes)*8
+            ret["Concatenated Bits (LZ4):"] = min(concat_lz4_bytes, total_size_bytes)*8
         else:
             concat_perc_saving_zstd = max(round((1 - (concat_zstd_bytes/total_size_bytes))*100, 3), 0.000)
             concat_perc_saving_lz4 = max(round((1 - (concat_lz4_bytes/total_size_bytes))*100, 3), 0.000)
+            ret["Concatenated Bits (ZSTD):"] = concat_zstd_bytes*8
+            ret["Concatenated Bits (LZ4):"] = concat_lz4_bytes*8
         #get the average too
         concat_zstd_s = [concat[n]["Concatenated % Savings (ZSTD):"] for n in range(N)]
         concat_lz4_s = [concat[n]["Concatenated % Savings (LZ4):"] for n in range(N)]
@@ -612,8 +666,8 @@ def bitplane_compression_benchmark(tensor_d, title): #repolaces run_phased_bench
     pd.set_option('display.max_columns', None)
     pd.set_option('display.width', 150)
     print(df1)
-    print("Concat % Saving Overall (ZSTD): " + str(concat_perc_saving_zstd) + ", Average: " + str(concat_zstd_avg))
-    print("Concat % Saving Overall (LZ4): " + str(concat_perc_saving_lz4) + ", Average: " + str(concat_lz4_avg))
+    print("Concat % Saving Overall (ZSTD) vs Quantized: " + str(concat_perc_saving_zstd) + ", Average: " + str(concat_zstd_avg))
+    print("Concat % Saving Overall (LZ4) vs Quantized: " + str(concat_perc_saving_lz4) + ", Average: " + str(concat_lz4_avg))
     print((W * B_b)/8)
         
     with multiprocessing.Pool(processes=cores) as pool: #will come back to this later. will need to change a bunch of stuff, add new metrics too
@@ -671,329 +725,56 @@ def bitplane_compression_benchmark(tensor_d, title): #repolaces run_phased_bench
     #pd.set_option('display.width', 150)
     #print(df)
     print(df0)
+    return ret #for further analytics
 
-#added some new features, like showing negative compression ratios or now
-#now it also returns some stuff:
-# - returns a dictionary: res
-# - res["Global(ZSTD):"], res["Global(LZ4):"], res["Temporal(ZSTD):"], res["Temporal(LZ4):"], res["Spatial(ZSTD):"], res["Spatial(LZ4):"], res["Original Size(Bits):"]
-# - keep in mind that the return results will change depending on if negative compression ratios are active or not
-# - keep in mind that all results are returned in the number of bits, not bytes
-def run_phased_benchmark(tensor_d, form, variant): 
-    import torch
-    import multiprocessing
-    import zstandard as zstd
-    import pandas as pd
-    import numpy
-    import lz4.frame
-    
-    #clear xpu memory: this is especially important for very large tensors that fill your VRAM
-    torch.xpu.empty_cache()
-    
-    #if the original input is not a tensor, convert it to a tensor
-    if(torch.is_tensor(tensor_d) == False):
-        tensor_d = torch.from_numpy(tensor_d).to(ACCELERATION_DEVICE)
-    
-    #new, for return value for further metrics about space saving
-    res = {"Global(ZSTD):": 0, "Global(LZ4):": 0, "Temporal(ZSTD):": 0, "Temporal(LZ4):": 0, "Spatial(ZSTD):": 0, "Spatial(LZ4):": 0, "Original Size(Bits):": tensor_d.shape[0] * tensor_d.shape[1] * tensor_d.shape[2]}
-    
-    #get the proper N,W,B values depending on if it is vertical or horizontal (if orig tensor is (N,W,B)), and do rest of setup
-    if(form == "horizontal"): #typically how the CPU handles tokens
-        N,B,W = tensor_d.shape
-        #get the required packed_values
-        packed_n = pack_bits(tensor_d, dim=0) #packed across n in this case
-        packed_b = pack_bits(tensor_d, dim=2) #packed across w in this case
-        #get the required tensor forms for Global, Temporal, and Spatial
-    elif(form == "vertical"): #common for KV-cache optimizations and columnar databases
-        W,B,N = tensor_d.shape
-        #get the required packed_values
-        packed_b = pack_bits(tensor_d, dim=2) #packed across n in this case
-        packed_n = pack_bits(tensor_d, dim=0) #packed across w in this case
-        #get the required tensor forms for Global, Temporal, and Spatial
-    
-    #now universal benchmark setup
-    print("\nLZ4+ZSTD Results for " + form + "-" + variant + ": " + str(tensor_d.shape))#tag modifier title
-    orig_size_kb = (N * W) / (1024 * 8) #gets it in bytes becuase the compressors return size in bytes
-    print("B: " + str(B))
-    B_b = B
-    results = {k: {"Bitplane": k} for k in range(B_b)} #setting up the title
-    cores = min(B_b, multiprocessing.cpu_count())
-    check_tensor_entropy(tensor_d)
-    with multiprocessing.Pool(processes=cores) as pool:
-        if(form == "horizontal"): #(N,B,W)
-            print("Stage 1: Global Analysis...") #overall compression per bitplane
-            #packed_b (packs across w)
-            b_global = packed_b.permute(1,0,2).contiguous().cpu().numpy()
-            globaltasks = [[b_global[k].tobytes()] for k in range(B_b)]
-            z_gsizes = pool.map(zstd_compress_list, globaltasks)
-            l_gsizes = pool.map(lz4_compress_list, globaltasks)
-            if(SHOW_NEGATIVE_COMPRESSION_RATIOS == False):
-                for k in range(B_b):
-                    gh_z = round((z_gsizes[k]/1024) / orig_size_kb, 3)
-                    gh_l = round((l_gsizes[k]/1024) / orig_size_kb, 3)
-                    results[k]["Global(ZSTD):"] = gh_z if gh_z < 1.0 else 1.000
-                    results[k]["Global(LZ4):"] = gh_l if gh_l < 1.0 else 1.000
-                    #add to return results too
-                    res["Global(ZSTD):"] += z_gsizes[k]*8 if z_gsizes[k] < (orig_size_kb*1024) else orig_size_kb*1024*8
-                    res["Global(LZ4):"] += l_gsizes[k]*8 if l_gsizes[k] < (orig_size_kb*1024) else orig_size_kb*1024*8
-            else:
-                for k in range(B_b):
-                    results[k]["Global(ZSTD):"] = round((z_gsizes[k]/1024) / orig_size_kb, 3)
-                    results[k]["Global(LZ4):"] = round((l_gsizes[k]/1024) / orig_size_kb, 3)
-                    #add to return results too
-                    res["Global(ZSTD):"] += z_gsizes[k]*8
-                    res["Global(LZ4):"] += l_gsizes[k]*8
-            print("Stage 2: Temporal Analysis...") #consistency across all rows/embeddings of a single dim, there are multiple dims
-            #packed_n (packs across n) #this one is pretty important for redundancy across all rows per dim per bitplane [main horizontal benchmark]
-            n_spatial = packed_n.permute(1,2,0).contiguous().cpu().numpy()
-            spatialtasks = list()
-            if(SHOW_NEGATIVE_COMPRESSION_RATIOS == False):
-                for k in range(B_b):
-                    bitplanetasks = [[n_spatial[k][x].tobytes()] for x in range(n_spatial.shape[1])]
-                    z_ssizes = sum(pool.map(zstd_compress_list, bitplanetasks))
-                    l_ssizes = sum(pool.map(lz4_compress_list, bitplanetasks))
-                    sh_z = round((z_ssizes/1024) / orig_size_kb, 3)
-                    sh_l = round((l_ssizes/1024) / orig_size_kb, 3)
-                    results[k]["Temporal(ZSTD):"] = sh_z if sh_z < 1.0 else 1.000
-                    results[k]["Temporal(LZ4):"] = sh_l if sh_l < 1.0 else 1.000
-                    #add to return results too
-                    res["Temporal(ZSTD):"] += z_ssizes*8 if z_ssizes < (orig_size_kb*1024) else orig_size_kb*1024*8
-                    res["Temporal(LZ4):"] += l_ssizes*8 if l_ssizes < (orig_size_kb*1024) else orig_size_kb*1024*8
-            else:
-                for k in range(B_b):
-                    bitplanetasks = [[n_spatial[k][x].tobytes()] for x in range(n_spatial.shape[1])]
-                    z_ssizes = sum(pool.map(zstd_compress_list, bitplanetasks))
-                    l_ssizes = sum(pool.map(lz4_compress_list, bitplanetasks))
-                    results[k]["Temporal(ZSTD):"] = round((z_ssizes/1024) / orig_size_kb, 3)
-                    results[k]["Temporal(LZ4):"] = round((l_ssizes/1024) / orig_size_kb, 3)
-                    #add to return results too
-                    res["Temporal(ZSTD):"] += z_ssizes*8
-                    res["Temporal(LZ4):"] += l_ssizes*8
-            print("Stage 3: Spatial Analysis...") #consistency within the dim of a single embedding, across multiple embeddings
-            #packed_b (packs across w)
-            b_temporal = packed_b.permute(1,0,2).contiguous().cpu().numpy()
-            temporaltasks = list()
-            if(SHOW_NEGATIVE_COMPRESSION_RATIOS == False): #use this for the rewrite
-                for k in range(B_b):
-                    bitplanetasks = [[b_temporal[k][x].tobytes()] for x in range(b_temporal.shape[1])]
-                    z_tsizes = sum(pool.map(zstd_compress_list, bitplanetasks))
-                    l_tsizes = sum(pool.map(lz4_compress_list, bitplanetasks))
-                    th_z = round((z_tsizes/1024) / orig_size_kb, 3)
-                    th_l = round((l_tsizes/1024) / orig_size_kb, 3)
-                    results[k]["Spatial(ZSTD):"] = th_z if th_z < 1.0 else 1.000
-                    results[k]["Spatial(LZ4):"] = th_l if th_l < 1.0 else 1.000
-                    #add to return results too
-                    res["Spatial(ZSTD):"] += z_tsizes*8 if z_tsizes < (orig_size_kb*1024) else orig_size_kb*1024*8
-                    res["Spatial(LZ4):"] += l_tsizes*8 if l_tsizes < (orig_size_kb*1024) else orig_size_kb*1024*8
-            else:
-                for k in range(B_b):
-                    bitplanetasks = [[b_temporal[k][x].tobytes()] for x in range(b_temporal.shape[1])]
-                    z_tsizes = sum(pool.map(zstd_compress_list, bitplanetasks))
-                    l_tsizes = sum(pool.map(lz4_compress_list, bitplanetasks))
-                    results[k]["Spatial(ZSTD):"] = round((z_tsizes/1024) / orig_size_kb, 3)
-                    results[k]["Spatial(LZ4):"] = round((l_tsizes/1024) / orig_size_kb, 3)
-                    #add to the return results too
-                    res["Spatial(ZSTD):"] += z_tsizes*8
-                    res["Spatial(LZ4):"] += l_tsizes*8
-        elif(form == "vertical"): #(W,B,N)
-            print("Stage 1: Global Analysis...") #overall compression per bitplane
-            #packed_b (packs across n), Seems like an important benchmark?
-            b_global = packed_b.permute(1,0,2).contiguous().cpu().numpy() #(W,B,N) --> (B,W,N) for access reasons
-            globaltasks = [[b_global[x].tobytes()] for x in range(B_b)]
-            z_gsizes = pool.map(zstd_compress_list, globaltasks)
-            l_gsizes = pool.map(lz4_compress_list, globaltasks)
-            if(SHOW_NEGATIVE_COMPRESSION_RATIOS == False):
-                for k in range(B_b):
-                    gv_z = round((z_gsizes[k]/1024) / orig_size_kb, 3)
-                    gv_l = round((l_gsizes[k]/1024) / orig_size_kb, 3)
-                    results[k]["Global(ZSTD):"] = gv_z if gv_z < 1.0 else 1.000
-                    results[k]["Global(LZ4):"] = gv_l if gv_l < 1.0 else 1.000
-                    #add to the return results too
-                    res["Global(ZSTD):"] += z_gsizes[k]*8 if z_gsizes[k] < (orig_size_kb*1024) else orig_size_kb*1024*8
-                    res["Global(LZ4):"] += l_gsizes[k]*8 if l_gsizes[k] < (orig_size_kb*1024) else orig_size_kb*1024*8
-            else:
-                for k in range(B_b):
-                    results[k]["Global(ZSTD):"] = round((z_gsizes[k]/1024) / orig_size_kb, 3)
-                    results[k]["Global(LZ4):"] = round((l_gsizes[k]/1024) / orig_size_kb, 3)
-                    #add to the return results too
-                    res["Global(ZSTD):"] += z_gsizes[k]*8
-                    res["Global(LZ4):"] += l_gsizes[k]*8
-            print("Stage 2: Temporal Analysis...") #consistency across all rows/embeddings of a single dim, there are multiple dims
-            #packed_b (packs across n), This is an important benchmark, finds the redundancy per bitplane across all vector embeddings/tokens, per vector dim
-            b_temporal = packed_b.permute(1,0,2).contiguous().cpu().numpy() #(W,B,N) --> (B,W,N) for access reasons
-            temporaltasks = list()
-            if(SHOW_NEGATIVE_COMPRESSION_RATIOS == False):
-                for k in range(B_b):
-                    bitplanetasks = [[b_temporal[k][x].tobytes()] for x in range(b_temporal.shape[1])]
-                    z_tsizes = sum(pool.map(zstd_compress_list, bitplanetasks))
-                    l_tsizes = sum(pool.map(lz4_compress_list, bitplanetasks))
-                    tv_z = round((z_tsizes/1024) / orig_size_kb, 3)
-                    tv_l = round((l_tsizes/1024) / orig_size_kb, 3)
-                    results[k]["Temporal(ZSTD):"] = tv_z if tv_z < 1.0 else 1.000
-                    results[k]["Temporal(LZ4):"] = tv_l if tv_l < 1.0 else 1.000
-                    #add to the return results too
-                    res["Temporal(ZSTD):"] += z_tsizes*8 if z_tsizes < (orig_size_kb*1024) else orig_size_kb*1024*8
-                    res["Temporal(LZ4):"] += l_tsizes*8 if l_tsizes < (orig_size_kb*1024) else orig_size_kb*1024*8
-            else:
-                for k in range(B_b):
-                    bitplanetasks = [[b_temporal[k][x].tobytes()] for x in range(b_temporal.shape[1])]
-                    z_tsizes = sum(pool.map(zstd_compress_list, bitplanetasks))
-                    l_tsizes = sum(pool.map(lz4_compress_list, bitplanetasks))
-                    results[k]["Temporal(ZSTD):"] = round((z_tsizes/1024) / orig_size_kb, 3)
-                    results[k]["Temporal(LZ4):"] = round((l_tsizes/1024) / orig_size_kb, 3)
-                    #add to the return results too
-                    res["Temporal(ZSTD):"] += z_tsizes*8
-                    res["Temporal(LZ4):"] += l_tsizes*8
-            print("Stage 3: Spatial Analysis...") #consistency across all dims of a single embedding/row, there are multiple embeddings/rows
-            #packed_n (packs across w)
-            n_spatial = packed_n.permute(1,2,0).contiguous().cpu().numpy() #(W,B,N) --> (B,N,W) for access reasons
-            spatialtasks = list()
-            if(SHOW_NEGATIVE_COMPRESSION_RATIOS == False):
-                for k in range(B_b):
-                    bitplanetasks = [[n_spatial[k][x].tobytes()] for x in range(n_spatial.shape[1])]
-                    z_ssizes = sum(pool.map(zstd_compress_list, bitplanetasks))
-                    l_ssizes = sum(pool.map(lz4_compress_list, bitplanetasks))
-                    sv_z = round((z_ssizes/1024) / orig_size_kb, 3)
-                    sv_l = round((l_ssizes/1024) / orig_size_kb, 3)
-                    results[k]["Spatial(ZSTD):"] = sv_z if sv_z < 1.0 else 1.000
-                    results[k]["Spatial(LZ4):"] = sv_l if sv_l < 1.0 else 1.000
-                    #add to the return results too
-                    res["Spatial(ZSTD):"] += z_ssizes*8 if z_ssizes < (orig_size_kb*1024) else orig_size_kb*1024*8
-                    res["Spatial(LZ4):"] += l_ssizes*8 if l_ssizes < (orig_size_kb*1024) else orig_size_kb*1024*8
-            else:
-                for k in range(B_b):
-                    bitplanetasks = [[n_spatial[k][x].tobytes()] for x in range(n_spatial.shape[1])]
-                    z_ssizes = sum(pool.map(zstd_compress_list, bitplanetasks))
-                    l_ssizes = sum(pool.map(lz4_compress_list, bitplanetasks))
-                    results[k]["Spatial(ZSTD):"] = round((z_ssizes/1024) / orig_size_kb, 3)
-                    results[k]["Spatial(LZ4):"] = round((l_ssizes/1024) / orig_size_kb, 3)
-                    #add to the return results too
-                    res["Spatial(ZSTD):"] += z_ssizes*8
-                    res["Spatial(LZ4):"] += l_ssizes*8
-    
-    #now, print and return the results
-    df = pd.DataFrame(list(results.values())).sort_values("Bitplane", ascending=False)
-    pd.set_option('display.max_columns', None)
-    print(df)
-    #print("\nDEBUG: Compressed Sizes per Technique in Bits: ")
-    #print(res)
-    return res
-
-def space_saving_metrics(bit_comp_quant, bit_comp_scale, Raw_size, direct_size, direct_quantized_size):
+def space_saving_metrics(bit_comp_quant, scale_tens, raw_tens, quant_raw):
     import pandas as pd
     import numpy as np
-    framedata = [[],[],[0,0,0,0,0,0],[0,0,0,0,0,0]]
+    import torch
+    framedata = [[],[],[],[]]
+    #preparing for calculations
+    scalar_bits = scale_tens.shape[0]*scale_tens.shape[1]*scale_tens.shape[2] #note: scale_tens must be the bitplane one
+    global BASE_TYPE
+    bitsize = 0
+    BASE_TYPE = torch.as_tensor(np.array([], dtype=BASE_TYPE)).dtype
+    if(BASE_TYPE.is_floating_point):
+        bitsize += torch.finfo(BASE_TYPE).bits
+    else:
+        bitsize += torch.iinfo(BASE_TYPE).bits
+    Raw_size = raw_tens.shape[0]*raw_tens.shape[1]*bitsize #note: raw_tens must be the initial tensor before any quantization or bitplaning
+    print("DEBUG: DIRECT SIZE RIGHT BEFORE COMPRESSION: ")
+    direct_size = direct_compression(raw_tens) #this is the size in bits of directly compressing raw_tens
+    print("DEBUG: DIRECT QUANTIZED SIZE RIGHT BEFORE COMPRESSION: ")
+    direct_quantized_size = direct_compression(quant_raw) #this is the size in bits of directly compressing quant_raw (without bitplanes)
     #most important: Compressed Bit Quant+Scale vs Original Prequantized Uncompressed
-    #Global(ZSTD):
-    framedata[0].append(round((1-((bit_comp_quant["Global(ZSTD):"]+bit_comp_scale["Global(ZSTD):"])/Raw_size))*100, 3))
-    #Global(LZ4):
-    framedata[0].append(round((1-((bit_comp_quant["Global(LZ4):"]+bit_comp_scale["Global(LZ4):"])/Raw_size))*100, 3))
-    #Temporal(ZSTD):
-    framedata[0].append(round((1-((bit_comp_quant["Temporal(ZSTD):"]+bit_comp_scale["Temporal(ZSTD):"])/Raw_size))*100, 3))
-    #Temporal(LZ4):
-    framedata[0].append(round((1-((bit_comp_quant["Temporal(LZ4):"]+bit_comp_scale["Temporal(LZ4):"])/Raw_size))*100, 3))
-    #Spatial(ZSTD):
-    framedata[0].append(round((1-((bit_comp_quant["Spatial(ZSTD):"]+bit_comp_scale["Spatial(ZSTD):"])/Raw_size))*100, 3))
-    #Spatial(LZ4):
-    framedata[0].append(round((1-((bit_comp_quant["Spatial(LZ4):"]+bit_comp_scale["Spatial(LZ4):"])/Raw_size))*100, 3))
+    #(ZSTD):
+    framedata[0].append(round((1-((bit_comp_quant["Concatenated Bits (ZSTD):"]+scalar_bits)/Raw_size))*100, 3))
+    #(LZ4):
+    framedata[0].append(round((1-((bit_comp_quant["Concatenated Bits (LZ4):"]+scalar_bits)/Raw_size))*100, 3))
     #now do: Compressed Bit Quant+Scale vs Bit Quant+Scale Uncompressed
-    #Global(ZSTD):
-    framedata[1].append(round((1-((bit_comp_quant["Global(ZSTD):"]+bit_comp_scale["Global(ZSTD):"])/(bit_comp_quant["Original Size(Bits):"]+bit_comp_scale["Original Size(Bits):"])))*100, 3))
-    #Global(LZ4):
-    framedata[1].append(round((1-((bit_comp_quant["Global(LZ4):"]+bit_comp_scale["Global(LZ4):"])/(bit_comp_quant["Original Size(Bits):"]+bit_comp_scale["Original Size(Bits):"])))*100, 3))
-    #Temporal(ZSTD):
-    framedata[1].append(round((1-((bit_comp_quant["Temporal(ZSTD):"]+bit_comp_scale["Temporal(ZSTD):"])/(bit_comp_quant["Original Size(Bits):"]+bit_comp_scale["Original Size(Bits):"])))*100, 3))
-    #Temporal(LZ4):
-    framedata[1].append(round((1-((bit_comp_quant["Temporal(LZ4):"]+bit_comp_scale["Temporal(LZ4):"])/(bit_comp_quant["Original Size(Bits):"]+bit_comp_scale["Original Size(Bits):"])))*100, 3))
-    #Spatial(ZSTD):
-    framedata[1].append(round((1-((bit_comp_quant["Spatial(ZSTD):"]+bit_comp_scale["Spatial(ZSTD):"])/(bit_comp_quant["Original Size(Bits):"]+bit_comp_scale["Original Size(Bits):"])))*100, 3))
-    #Spatial(LZ4):
-    framedata[1].append(round((1-((bit_comp_quant["Spatial(LZ4):"]+bit_comp_scale["Spatial(LZ4):"])/(bit_comp_quant["Original Size(Bits):"]+bit_comp_scale["Original Size(Bits):"])))*100, 3))
+    #(ZSTD):
+    framedata[1].append(round((1-((bit_comp_quant["Concatenated Bits (ZSTD):"]+scalar_bits)/(bit_comp_quant["Original Quantized Bits:"]+scalar_bits)))*100, 3))
+    #(LZ4):
+    framedata[1].append(round((1-((bit_comp_quant["Concatenated Bits (LZ4):"]+scalar_bits)/(bit_comp_quant["Original Quantized Bits:"]+scalar_bits)))*100, 3))
     #do the others later
-    #others now are optional, denoted by [0] = -1
-    if(direct_size[0] != -1):
-        #Global(ZSTD):
-        framedata[2][0] = round((1-((bit_comp_quant["Global(ZSTD):"]+bit_comp_scale["Global(ZSTD):"])/direct_size[0]))*100, 3)
-        #Global(LZ4):
-        framedata[2][1] = round((1-((bit_comp_quant["Global(LZ4):"]+bit_comp_scale["Global(LZ4):"])/direct_size[1]))*100, 3)
-        #Temporal(ZSTD):
-        framedata[2][2] = round((1-((bit_comp_quant["Temporal(ZSTD):"]+bit_comp_scale["Temporal(ZSTD):"])/direct_size[0]))*100, 3)
-        #Temporal(LZ4):
-        framedata[2][3] = round((1-((bit_comp_quant["Temporal(LZ4):"]+bit_comp_scale["Temporal(LZ4):"])/direct_size[1]))*100, 3)
-        #Spatial(ZSTD):
-        framedata[2][4] = round((1-((bit_comp_quant["Spatial(ZSTD):"]+bit_comp_scale["Spatial(ZSTD):"])/direct_size[0]))*100, 3)
-        #Spatial(LZ4):
-        framedata[2][5] = round((1-((bit_comp_quant["Spatial(LZ4):"]+bit_comp_scale["Spatial(LZ4):"])/direct_size[1]))*100, 3)
-    if(direct_quantized_size[0] != -1):
-        #Global(ZSTD):
-        framedata[3][0] = round((1-((bit_comp_quant["Global(ZSTD):"]+bit_comp_scale["Global(ZSTD):"])/direct_quantized_size[0]))*100, 3)
-        #Global(LZ4):
-        framedata[3][1] = round((1-((bit_comp_quant["Global(LZ4):"]+bit_comp_scale["Global(LZ4):"])/direct_quantized_size[1]))*100, 3)
-        #Temporal(ZSTD):
-        framedata[3][2] = round((1-((bit_comp_quant["Temporal(ZSTD):"]+bit_comp_scale["Temporal(ZSTD):"])/direct_quantized_size[0]))*100, 3)
-        #Temporal(LZ4):
-        framedata[3][3] = round((1-((bit_comp_quant["Temporal(LZ4):"]+bit_comp_scale["Temporal(LZ4):"])/direct_quantized_size[1]))*100, 3)
-        #Spatial(ZSTD):
-        framedata[3][4] = round((1-((bit_comp_quant["Spatial(ZSTD):"]+bit_comp_scale["Spatial(ZSTD):"])/direct_quantized_size[0]))*100, 3)
-        #Spatial(LZ4):
-        framedata[3][5] = round((1-((bit_comp_quant["Spatial(LZ4):"]+bit_comp_scale["Spatial(LZ4):"])/direct_quantized_size[1]))*100, 3)
+    #vs Direct Compression
+    #(ZSTD):
+    framedata[2].append(round((1-((bit_comp_quant["Concatenated Bits (ZSTD):"]+scalar_bits)/direct_size[0]))*100, 3))
+    #(LZ4):
+    framedata[2].append(round((1-((bit_comp_quant["Concatenated Bits (LZ4):"]+scalar_bits)/direct_size[1]))*100, 3))
+    #vs Quant Compressed + Scale (No bitplanes)
+    #(ZSTD):
+    framedata[3].append(round((1-((bit_comp_quant["Concatenated Bits (ZSTD):"]+scalar_bits)/(direct_quantized_size[0]+scalar_bits)))*100, 3))
+    #(LZ4):
+    framedata[3].append(round((1-((bit_comp_quant["Concatenated Bits (LZ4):"]+scalar_bits)/(direct_quantized_size[1]+scalar_bits)))*100, 3))
     #now print
     df = pd.DataFrame(np.array(framedata))
-    df.columns = ['Global(ZSTD):','Global(LZ4):', 'Temporal(ZSTD):', 'Temporal(LZ4):', 'Spatial(ZSTD):', 'Spatial(LZ4):']
-    df.index = ['vs Original Data Size:', 'vs Quantized+Scalar:', 'vs Direct Compression:', 'vs Quant+Scale Compressed (No BP):'] #rows
+    df.columns = ['Concatenated % Savings (ZSTD):','Concatenated % Savings (LZ4):']
+    df.index = ['vs Original Data Size:', 'vs Quantized+Scalar:', 'vs Direct Compression:', 'vs Quant Compressed+Scale (No BP):'] #rows
     pd.set_option('display.max_columns', None)
     pd.set_option('display.width', 150)
     print(df)
-    print("\n Extra: Uncompressed Bitplaned Quant+Scalar vs Uncompressed Bitplaned Original Tensor: " + str(round((1-((bit_comp_quant["Original Size(Bits):"]+bit_comp_scale["Original Size(Bits):"])/Raw_size))*100, 3)))
-
-def raw_space_metrics(bit_comp, Raw_size, direct_size):
-    import pandas as pd
-    import numpy as np
-    #note: direct_size is optional, put [-1] if you don't want it to be used
-    # --> direct_size is if you want to compare bitplane compressed size to the direct compressed size
-    
-    framedata = [[]] #set up data
-    #get data
-    #Global(ZSTD):
-    framedata[0].append(round((1-((bit_comp["Global(ZSTD):"])/Raw_size))*100, 3))
-    #Global(LZ4):
-    framedata[0].append(round((1-((bit_comp["Global(LZ4):"])/Raw_size))*100, 3))
-    #Temporal(ZSTD):
-    framedata[0].append(round((1-((bit_comp["Temporal(ZSTD):"])/Raw_size))*100, 3))
-    #Temporal(LZ4):
-    framedata[0].append(round((1-((bit_comp["Temporal(LZ4):"])/Raw_size))*100, 3))
-    #Spatial(ZSTD):
-    framedata[0].append(round((1-((bit_comp["Spatial(ZSTD):"])/Raw_size))*100, 3))
-    #Spatial(LZ4):
-    framedata[0].append(round((1-((bit_comp["Spatial(LZ4):"])/Raw_size))*100, 3))
-    #then print
-    df = pd.DataFrame(np.array(framedata))
-    df.columns = ['Global(ZSTD):','Global(LZ4):', 'Temporal(ZSTD):', 'Temporal(LZ4):', 'Spatial(ZSTD):', 'Spatial(LZ4):']
-    df.index = ['vs Original Data Size:']
-    pd.set_option('display.max_columns', None)
-    pd.set_option('display.width', 150)
-    print(df)
-    
-    #optional direct size too
-    if(direct_size[0] != -1): #note: for this part, you must run direct_compression(tens) before running this function
-        framedata2 = [[]] #set up data
-        #get data
-        #Global(ZSTD):
-        framedata2[0].append(round((1-((bit_comp["Global(ZSTD):"])/direct_size[0]))*100, 3))
-        #Global(LZ4):
-        framedata2[0].append(round((1-((bit_comp["Global(LZ4):"])/direct_size[1]))*100, 3))
-        #Temporal(ZSTD):
-        framedata2[0].append(round((1-((bit_comp["Temporal(ZSTD):"])/direct_size[0]))*100, 3))
-        #Temporal(LZ4):
-        framedata2[0].append(round((1-((bit_comp["Temporal(LZ4):"])/direct_size[1]))*100, 3))
-        #Spatial(ZSTD):
-        framedata2[0].append(round((1-((bit_comp["Spatial(ZSTD):"])/direct_size[0]))*100, 3))
-        #Spatial(LZ4):
-        framedata2[0].append(round((1-((bit_comp["Spatial(LZ4):"])/direct_size[1]))*100, 3))
-        #then print
-        df2 = pd.DataFrame(np.array(framedata2))
-        df2.columns = ['Global(ZSTD):','Global(LZ4):', 'Temporal(ZSTD):', 'Temporal(LZ4):', 'Spatial(ZSTD):', 'Spatial(LZ4):']
-        df2.index = ['vs Direct [ZSTD,LZ4]:']
-        print(df2)
+    print("\n Extra: Uncompressed Bitplaned Quant+Scalar vs Uncompressed Bitplaned Original Tensor: " + str(round((1-((bit_comp_quant["Original Quantized Bits:"]+scalar_bits)/Raw_size))*100, 3)))
 
 def direct_compression(tens):
     import zstandard as zstd
@@ -1006,6 +787,7 @@ def direct_compression(tens):
     
     #get the raw bytes
     rawbytes = tens.cpu().numpy().tobytes()
+    print("DIRECT BYTES: " + str(len(rawbytes)))
     
     #do zstd compression first
     c_z = zstd.ZstdCompressor(level=3)
@@ -1033,58 +815,6 @@ def direct_compression(tens):
         direc_ratio_l = direc_ratio_l if direc_ratio_l < 1.000 else 1.000
         direc_perc_l = direc_perc_l if direc_perc_l >= 0.000 else 0.000
     print("\nDirect Compression(LZ4) Ratio & % Memory Saving: " + str(direc_ratio_l) + " , " + str(direc_perc_l) + "%")
-    lz4_bits = lz4_size * 8 #in bits
-    
-    return zstd_bits, lz4_bits
-
-def direct_quantized_compression(quant, scale):
-    import zstandard as zstd
-    import numpy as np
-    import lz4.frame
-    import torch
-    
-    if(torch.is_tensor(quant) == False):
-        quant = torch.from_numpy(quant).to(ACCELERATION_DEVICE)
-    if(torch.is_tensor(scale) == False):
-        scale = torch.from_numpy(scale).to(ACCELERATION_DEVICE)
-    
-    #get the raw bytes
-    rawbytes_q = quant.cpu().numpy().tobytes()
-    rawbytes_s = scale.cpu().numpy().tobytes()
-    
-    #do zstd compression first
-    c_z = zstd.ZstdCompressor(level=3)
-    zstd_size = 0 #in bytes
-    for i in range(0, len(rawbytes_q), BLOCK_SIZE):
-        block = rawbytes_q[i : i + BLOCK_SIZE]
-        #handle with zero padding if needed
-        if(len(block) < BLOCK_SIZE):
-            block = block.ljust(BLOCK_SIZE, b'\x00')
-        
-        zstd_size += len(c_z.compress(block))
-    for i in range(0, len(rawbytes_s), BLOCK_SIZE):
-        block = rawbytes_s[i : i + BLOCK_SIZE]
-        #handle with zero padding if needed
-        if(len(block) < BLOCK_SIZE):
-            block = block.ljust(BLOCK_SIZE, b'\x00')
-        
-        zstd_size += len(c_z.compress(block))
-    direc_ratio_z = round(float(zstd_size/(len(rawbytes_q)+len(rawbytes_s))), 3)
-    direc_perc_z = round((1-(zstd_size/(len(rawbytes_q)+len(rawbytes_s))))*100, 3)
-    if(SHOW_NEGATIVE_COMPRESSION_RATIOS == False):
-        direc_ratio_z = direc_ratio_z if direc_ratio_z < 1.000 else 1.000
-        direc_perc_z = direc_perc_z if direc_perc_z >= 0.000 else 0.000
-    print("\nDirect Compression(ZSTD, Quant+Scale) Ratio & % Memory Saving: " + str(direc_ratio_z) + " , " + str(direc_perc_z) + "%")
-    zstd_bits = zstd_size * 8 #size of zstd compressed in bits
-    
-    #then, do lz4 compression
-    lz4_size = len(lz4.frame.compress(rawbytes_q, block_size=BLOCK_SIZE)) + len(lz4.frame.compress(rawbytes_s, block_size=BLOCK_SIZE)) #in bytes
-    direc_ratio_l = round(float(lz4_size/(len(rawbytes_q)+len(rawbytes_s))), 3)
-    direc_perc_l = round((1-(lz4_size/(len(rawbytes_q)+len(rawbytes_s))))*100, 3)
-    if(SHOW_NEGATIVE_COMPRESSION_RATIOS == False):
-        direc_ratio_l = direc_ratio_l if direc_ratio_l < 1.000 else 1.000
-        direc_perc_l = direc_perc_l if direc_perc_l >= 0.000 else 0.000
-    print("\nDirect Compression(LZ4, Quant+Scale) Ratio & % Memory Saving: " + str(direc_ratio_l) + " , " + str(direc_perc_l) + "%")
     lz4_bits = lz4_size * 8 #in bits
     
     return zstd_bits, lz4_bits
@@ -1155,6 +885,8 @@ def plot_embedding_histogram(tensor,filepath): #gets the histogram of the range 
 def RLE_bitplane_compressibility(matrix, title):
     import torch
     import numpy
+    #clear xpu memory: this is especially important for very large tensors that fill your VRAM
+    torch.xpu.empty_cache()
     #we need to standardize input to tensor form (no numpy.ndarrays)
     MAT = matrix
     if(isinstance(matrix, numpy.ndarray)):
@@ -1269,18 +1001,25 @@ def run_simulation():
     print(quantized_bitplane)
     print("Scalar Bitplanes: " + str(scalar_bitplane.shape))
     print(scalar_bitplane)
-    raw_bitplane = direct_bitplane(normalized_tensor)
-    print("Raw Bitplanes: " + str(raw_bitplane.shape))
-    print(raw_bitplane)
+    if(IGNORE_RAW == False):
+        raw_bitplane = direct_bitplane(normalized_tensor)
+        print("Raw Bitplanes: " + str(raw_bitplane.shape))
+        print(raw_bitplane)
     
     #stage 4.5 optional: RLE compression analysis
-    print("\nDEBUG: RLE Compression analysis on QUANT Horizontal: ")
-    rle_res = RLE_bitplane_compressibility(quantized_bitplane,"Quant-Horizontal")
-    #print(rle_res)
+    if(PRINT_RLE == True):
+        print("\nDEBUG: RLE Compression analysis on QUANT Horizontal: ")
+        rle_res = RLE_bitplane_compressibility(quantized_bitplane,"Quant-Horizontal")
+        if(IGNORE_RAW == False):
+            print("\nDEBUG: RLE Compression analysis on DIRECT Horizontal: ")
+            rle_raw = RLE_bitplane_compressibility(raw_bitplane,"Direct-Horizontal")
+        #print(rle_res)
     
     #stage 5+6: bitpacking (horizontally, packed_b) + LZ4 & ZSTD Bitplane compression (with metrics)
     print("\nSTAGE 5+6: Bitpacking + LZ4 & ZSTD Compression: ")
-    bitplane_compression_benchmark(quantized_bitplane, "bitplane quant horizontal")
+    quant_comp_results = bitplane_compression_benchmark(quantized_bitplane, "bitplane quant horizontal")
+    #now for some extra metrics:
+    space_saving_metrics(quant_comp_results, scalar_bitplane, normalized_tensor, quantized)
     #I want to test delta transformation too
     #it gives ~1% improvement, which is not good becuase it introduces computational complexity which hurts latency
     if(PRINT_DELTA_TRANSFORMATION == True):
@@ -1296,6 +1035,14 @@ def run_simulation():
         # Compressibility = (1 - Entropy)
         theoretical_savings = (1.0 - avg_h) * 100
         print(f"Bitplane {b} | Avg Entropy: {avg_h:.4f} | Max Potential Savings: {theoretical_savings:.2f}%")
+    
+    #raw
+    if(IGNORE_RAW == False):
+        bitplane_compression_benchmark(raw_bitplane, "bitplane direct horizontal")
+        if(PRINT_DELTA_TRANSFORMATION == True):
+            tensor_delta_raw = raw_bitplane.clone()
+            tensor_delta_raw[:, 1:] = raw_bitplane[:, 1:] - raw_bitplane[:, :-1]
+            bitplane_compression_benchmark(tensor_delta_raw, "delta transformation - horizontal raw")
     pass
 
 if  __name__ == "__main__":
