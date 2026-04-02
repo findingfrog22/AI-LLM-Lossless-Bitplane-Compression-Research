@@ -6,18 +6,59 @@ import os
 base_directory = os.path.dirname(os.path.abspath(__file__))
 import torch
 file_path = "" #don't touch this unless you know what you are doing
-NUM_ROWS = 1024 #This is for you to choose, it is the number of vector embeddings (essentially # of tokens)[must be a multiple of 8]
+NUM_ROWS = 100 #This is for you to choose, it is the number of vector embeddings (essentially # of tokens)[must be a multiple of 8]
 #Note: your NUM_ROWS should ideally exceed your BLOCK_SIZE, and for best results, should be a multiple of BLOCK_SIZE
-NUM_DIMS = 4096 #768 is default, but will automatically change with shape recognition
+NUM_DIMS = 768 #768 is default, but will automatically change with shape recognition
 MAX_ROWS = 10000 #10k is default, but will automatically change with shape recognition
 
+#Embedding model settings
+CHUNK_SIZE = 512
+#Only applies to average pooling (1) and CLS pooling (2), and only applies to embedding models
+#Determines the token chunking context mainly for average pooling. Higher chunk size has higher RAM/VRAM requirements
+#chunk size is essentially token context per vector embedding row, so CHUNK_SIZE = 512 means 512 tokens per 1 vector embedding
+
+BATCH_SIZE = 512
+#for hardware efficiency, doesn't effect results.
+#use lower batch sizes for weaker machines like iGPUs (256, 512, 1024, 2048)
+#use higher batch sizes for stronger dedicated GPUs (4096, 8192, etc)
+#For loose rule of thumb, CUDA Core count = CHUNK_SIZE * BATCH_SIZE
+#default: 512
+
+POOLING_TYPE = 0 #most embedding models will use their default pooling method, this setting overrides it
+#Determines how token semantics are pooled together during embedding model computations (changes results)
+# - 0: per-token vector embeddings (1 row per 1 token)
+# - 1: mean-row vector embeddings (averaged 1 line of tokens (chunk size) for 1 row) [common in RAG]
+# - 2: CLS/Last Token vector embedding (single vector, for all tokens) [common in certain embedding models]
+# - 3: use default pooling mode for that embedding [default]
+#note: 1 and 2 both automatically change the number of rows:
+# --> 1: changes it to min(NUM_ROWS, available rows)
+# --> 2: changes NUM_ROWS == 1
+
+TOKEN_CONTEXT = -1
+#this determines the context of tokens to generate each embedding row during the pooling phase
+#only applies to local embedding models, so precomputed ones don't use this
+#will only use this value if it is inside the limits of the model
+# - other
+# - -1 [default, uses model default, native setting]
+
+NUM_LINES = 100
+#this is the number of lines of text that the embedding model reads to convert to embeddings
+#make sure that it gives enough text for the embedding model to use, or else it might crash the program or
+# give unpredictable results
+# - 1024 [default]
+
+CHUNKING_MODE = True
+#This determines how things are chunked
+# - True: Uses sentence-based chunking, (Used for research, preserves semantic meaning) [default]
+# - False: Uses size/token-based chunking, (Typically used in RAG industry, loses semantic meaning)
+
 #quantization settings
-BASE_TYPE = torch.float32 #torch.float32 is default, will autochange during shape detection
+BASE_TYPE = torch.float32 #torch.float32 is default, will autochange during shape detection (embedding models will use their defaults)
 QUANTIZATION_TYPE = torch.int8 #You change this value, this is the resulting quantized values [Default, torch.int8]
 SCALE_TYPE = torch.float32 #torch.float32 is detault, will autochange during quantization
 
 #some LZ4 and ZSTD Compression Settings
-BLOCK_SIZE = 4096 #default - 4096 = 4KB
+BLOCK_SIZE = 1024 #default - 4096 = 4KB
 #Note: make sure that this BLOCK_SIZE divides evenly into (QuantTypeBits * NUM_DIMS)/8 (this is the Byte size per row)
 #, or else it will zero pad at the end and slightly throw off your results
 #Note: Also make sure that your BLOCK_SIZE <= (NUM_DIMS * QuantTypeBits)/8, or else your compression ratios are negative
@@ -44,14 +85,19 @@ SHOW_EXTRANEOUS_RESULTS = False #default false to improve performance [default F
 
 SHOW_NEGATIVE_COMPRESSION_RATIOS = False
 #Determines whether to compress the uncompressible or not
-# - True: will show negative compression ratios (>1.0) [default]
-# - False: will change any negative compression ratios to 1.0
+# - True: will show negative compression ratios (>1.0)
+# - False: will change any negative compression ratios to 1.0 [default]
 
-IGNORE_RAW = True
+IGNORE_RAW = False
 #Will skip the raw compression permutations. This saves on performance and VRAM,
 #,especially with large # of rows
 # - True: doesn't perform calculations on Prequantized data [default]
 # - False: performs calculations on prequantized data [warning, performance may drop]
+
+IGNORE_MANTISSA = False
+#Will only use the sign and exponent bits for compression analysis. Only applies to RAW bitplane (IGNORE_RAW must be False)
+# - True: only uses sign and exponent bits for compression analysis on RAW tensors (not quantized)
+# - False: Uses all bitplanes for compression analysis on RAW tensors (not quantized) [default]
 
 #Step -1: vector embedding generation
 
@@ -83,7 +129,7 @@ def _find_vector_column(sample_row):
             
     raise ValueError("Could not automatically detect a vector column.")
 
-def generate_local_embeddings(text, model_name):
+def generate_local_embeddings(text, model_name, pooling_mode, dim_count, max_context, native_context, bert, data_type):
     import os
     import json
     import io
@@ -96,11 +142,137 @@ def generate_local_embeddings(text, model_name):
     script_dir = Path(__file__).parent.resolve()
     model_dir = script_dir / "models"
     model_dir.mkdir(exist_ok=True)
+    
+    #allows the arc IGPU to use more vram than 4GB
+    if(ACCELERATION_DEVICE == "xpu"):
+        oneapi_path = r"C:\Program Files (x86)\Intel\oneAPI\compiler\latest\bin"
+        os.environ["PATH"] = oneapi_path + os.pathsep + os.environ["PATH"]
+        # Force the level_zero driver to select the GPU (iGPU/Arc)
+        os.environ["ONEAPI_DEVICE_SELECTOR"] = "level_zero:gpu"
+        # Optional: Helps with task submission performance on Arc
+        os.environ["SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS"] = "1"
+        #os.environ["GGML_SYCL_DEBUG"] = "1"
+        os.environ["SYCL_UR_USE_LEVEL_ZERO_V2"] = "1"
+        os.environ["UR_L0_USE_RELAXED_ALLOCATION_LIMITS"] = "1"
+        os.environ["ZES_ENABLE_SYSMAN"] = "1"
+        os.environ["GGML_SYCL_DEVICE"] = "0" # Forces the first Intel GPU
+        if(model_name == "e5-large-v2"):
+            os.environ["GGML_SYCL_F16_ACC"] = "0"
+    
+    #sets up some parameters
+    if(TOKEN_CONTEXT == -1):
+        context_n = native_context
+    else:
+        context_n = min(TOKEN_CONTEXT, max_context)
 
-    # GGUF MODELS (Llama-cpp-python)
+    # GGUF MODELS (Llama-cpp-python) #removed nomic from GGUF models, as it causes compatibility issues with certain backends, like vulkan
+    if model_name in ["qwen3", "e5-mistral", "nomic", "bge-m3", "e5-large-v2", "gemma-2", "snowflake-arctic-embed-v2.0"]:
+        from llama_cpp import Llama
+        from huggingface_hub import hf_hub_download
+        import llama_cpp
+        
+        configs = {
+            "qwen3": ("Qwen/Qwen3-Embedding-8B-GGUF", "Qwen3-Embedding-8B-f16.gguf"),
+            "e5-mistral": ("dranger003/e5-mistral-7b-instruct-GGUF", "ggml-e5-mistral-7b-instruct-f16.gguf"),
+            "nomic": ("nomic-ai/nomic-embed-text-v1.5-GGUF", "nomic-embed-text-v1.5.f32.gguf"),
+            "e5-large-v2": ("ChristianAzinn/e5-large-v2-gguf", "e5-large-v2_fp32.gguf"),
+            "bge-m3": ("gpustack/bge-m3-GGUF", "bge-m3-FP16.gguf"),
+            "gemma-2": ("alamios/gemma-2-9b-it-GGUF-f16", "gemma-2-9b-it.f16.gguf"),
+            "snowflake-arctic-embed-v2.0": ("Casual-Autopsy/snowflake-arctic-embed-l-v2.0-gguf", "snowflake-arctic-embed-l-v2.0-f32.gguf")
+        }
+        #original e5-mistral: ("intfloat/e5-mistral-7b-instruct", "e5-mistral-7b-instruct-f16.gguf")
+        repo, filename = configs[model_name]
+        m_path = hf_hub_download(repo_id=repo, filename=filename, local_dir=str(model_dir))
+        
+        #setting up engine parameters
+        if(ACCELERATION_DEVICE == "xpu"): #xpu sycl backend has some bugs/quirks that require attention
+            if(model_name == "e5-large-v2"):
+                engine = Llama(model_path=m_path, embedding=True, flash_attn=False, logits_all=True, pooling_type=pooling_mode, n_parallel=1, n_gpu_layers=0, n_threads=14, main_gpu=-1, offload_kqv=False, use_mmap=True, n_ctx=context_n, n_batch=BATCH_SIZE, n_ubatch=BATCH_SIZE, verbose=True)
+            else:
+                engine = Llama(model_path=m_path, embedding=True, flash_attn=False, logits_all=True, pooling_type=pooling_mode, n_parallel=1, n_gpu_layers=-1, use_mmap=True, n_ctx=context_n, n_batch=BATCH_SIZE, n_ubatch=BATCH_SIZE, verbose=False)
+        else:
+            engine = Llama(model_path=m_path, embedding=True, pooling_type=pooling_mode, n_gpu_layers=-1, main_gpu=0, n_ctx=context_n, n_batch=BATCH_SIZE, n_ubatch=BATCH_SIZE, verbose=False)
+        
+        if((pooling_mode == 1) or (pooling_mode == 2)):
+            #text = ''.join(text[:NUM_ROWS])
+            all_results = []
+            #print("print1")
+            if(isinstance(text, np.ndarray)):
+                text = text.tolist()
+            elif(isinstance(text, str)):
+                text = [text]
+            #print("print2")
+            total_text = text[:NUM_LINES]
+            #NOTE FOR 4/2+: You need to account for when lines are too long or too short
+            full_text = []
+            if(ACCELERATION_DEVICE == "xpu"): #xpu sycl library has a quirk where it can only embed 1 string line at a time
+                '''
+                if(CHUNKING_MODE == True):
+                    for line in total_text:
+                        tokens = engine.tokenize(line.encode('utf-8'))
+                        if(len(tokens) > context_n):
+                            engine.reset()
+                            res = engine.embed(tokens)
+                            full_text.append(np.array(res[0], dtype=data_type))
+                            #full_text.append(engine.create_embedding(input=tokens)['data'][0]['embedding'])
+                        else:
+                            for i in range(0, len(tokens), context_n):
+                                engine.reset()
+                                res = engine.embed(tokens[i:i+context_n])
+                                full_text.append(np.array(res[0], dtype=data_type))
+                                #full_text.append(engine.create_embedding(input=tokens[i:i+context_n])['data'][0]['embedding'])
+                        return np.array(full_text, dtype=data_type)
+                '''
+                vectors = [engine.create_embedding(line)['data'][0]['embedding'] for line in total_text]
+                return np.array(vectors, dtype=data_type)
+            else: #other backends can do all the embeddings at once
+                response = engine.create_embedding(total_text)
+                vectors = [row['embedding'] for row in response['data']]
+                return np.array(vectors, dtype=data_type)
+        elif(pooling_mode == 0):
+            text = ''.join(text[:NUM_ROWS])
+        return np.array(engine.create_embedding(text)['data'][0]['embedding'])
+    
+
+def generate_local_embeddings0(text, model_name, pooling_mode, dim_count, max_context, native_context, bert):
+    import os
+    import json
+    import io
+    import numpy as np
+    import pandas as pd
+    import zstandard as zstd
+    from pathlib import Path
+    import sentence_transformers
+    """Checks local 'models' folder, downloads if missing, and runs inference."""
+    script_dir = Path(__file__).parent.resolve()
+    model_dir = script_dir / "models"
+    model_dir.mkdir(exist_ok=True)
+    
+    #allows the arc IGPU to use more vram than 4GB
+    if(ACCELERATION_DEVICE == "xpu"):
+        oneapi_path = r"C:\Program Files (x86)\Intel\oneAPI\compiler\latest\bin"
+        os.environ["PATH"] = oneapi_path + os.pathsep + os.environ["PATH"]
+        # Force the level_zero driver to select the GPU (iGPU/Arc)
+        os.environ["ONEAPI_DEVICE_SELECTOR"] = "level_zero:gpu"
+        # Optional: Helps with task submission performance on Arc
+        os.environ["SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS"] = "1"
+        os.environ["GGML_SYCL_DEBUG"] = "1"
+        os.environ["SYCL_UR_USE_LEVEL_ZERO_V2"] = "1"
+        os.environ["UR_L0_USE_RELAXED_ALLOCATION_LIMITS"] = "1"
+        os.environ["ZES_ENABLE_SYSMAN"] = "1"
+        os.environ["GGML_SYCL_DEVICE"] = "0" # Forces the first Intel GPU
+    
+    #sets up some parameters
+    if(TOKEN_CONTEXT == -1):
+        context_n = native_context
+    else:
+        context_n = min(TOKEN_CONTEXT, max_context)
+
+    # GGUF MODELS (Llama-cpp-python) #removed nomic from GGUF models, as it causes compatibility issues with certain backends, like vulkan
     if model_name in ["qwen3", "e5-mistral", "nomic"]:
         from llama_cpp import Llama
         from huggingface_hub import hf_hub_download
+        import llama_cpp
         
         configs = {
             "qwen3": ("Qwen/Qwen3-Embedding-8B-GGUF", "Qwen3-Embedding-8B-f16.gguf"),
@@ -111,22 +283,253 @@ def generate_local_embeddings(text, model_name):
         repo, filename = configs[model_name]
         m_path = hf_hub_download(repo_id=repo, filename=filename, local_dir=str(model_dir))
         
-        engine = Llama(model_path=m_path, embedding=True, pooling_type=0, n_gpu_layers=-1, n_ctx=32768, verbose=False)
+        #setting up engine parameters
+        engine = Llama(model_path=m_path, embedding=True, flash_attn=False, logits_all=True, pooling_type=pooling_mode, n_parallel=4, n_gpu_layers=-1, main_gpu=0, use_mmap=False, n_ctx=context_n, n_batch=BATCH_SIZE, n_ubatch=BATCH_SIZE, verbose=True)
+        
+        if((pooling_mode == 1) or (pooling_mode == 2)):
+            #text = ''.join(text[:NUM_ROWS])
+            all_results = []
+            #print("print1")
+            if(isinstance(text, np.ndarray)):
+                text = text.tolist()
+            elif(isinstance(text, str)):
+                text = [text]
+            #print("print2")
+            total_text = text[:NUM_LINES]
+            #print(total_text)
+            #print("print3")
+            response = engine.create_embedding(total_text)
+            #print("print4")
+            vectors = [row['embedding'] for row in response['data']]
+            #print("print5")
+            return np.array(vectors)
+            #for i in range(0, NUM_ROWS):
+                #batch = text[i]
+                #response = engine.create_embedding(batch)
+                #vectors = [row['embedding'] for row in response['data']]
+                #all_results.append(vectors)
+            #return np.vstack(all_results)
+            '''
+            text = text[:NUM_ROWS]
+            return np.vstack(engine.create_embedding(text)['data'][0]['embedding'])
+            '''
+        elif(pooling_mode == 0):
+            text = ''.join(text[:NUM_ROWS])
         return np.array(engine.create_embedding(text)['data'][0]['embedding'])
-
+    
+    #
+    '''
+    elif model_name in ["nomic"]:
+        from transformers import AutoModel, AutoTokenizer
+        import torch.nn.functional as F
+        import torch
+        import numpy as np
+        import einops
+        if(isinstance(text, np.ndarray)):
+            text = text.tolist()
+        elif(isinstance(text, str)):
+            text = text.split("\n")
+            text = [t + "\n" for t in text]
+        #0. set up the model and tokenizer
+        tokenizer = AutoTokenizer.from_pretrained("nomic-ai/nomic-embed-text-v1.5", trust_remote_code=True)
+        model = AutoModel.from_pretrained("nomic-ai/nomic-embed-text-v1.5", trust_remote_code=True)
+        if(CHUNKING_MODE == True):
+            model.eval()
+            text = text[:NUM_LINES]
+            text_lines = []
+            prefix = "search_document:"
+            prefix_overhead = len(tokenizer.encode(prefix, add_special_tokens=False))
+            budget = context_n - prefix_overhead - 2
+            for line in text:
+                print("Before")
+                tokens = tokenizer.encode(line, add_special_tokens=False)
+                print("After")
+                if(len(tokens) <= budget):
+                    text_lines.append(line)
+                else:
+                    for i in range(0, len(tokens), budget):
+                        chunk = tokens[i : i + budget]
+                        # 3. Decode back to text so ST can re-tokenize it with special tokens
+                        decoded_chunk = tokenizer.decode(chunk, skip_special_tokens=True)
+                        text_lines.append(decoded_chunk)
+                del tokens
+            text_lines = [prefix + t for t in text_lines] #add the prefix, makes it more accurate
+            embeddings = []
+            #print(len(all_ids))
+            rows = 0
+            for chunk in text_lines:
+                #5. add the structural anchors for nomic/BERT
+                # [101] = CLS, [102] = SEP
+                print("5")
+                # This handles the [101] and [102] (CLS/SEP) automatically
+                inputs = tokenizer(chunk, return_tensors="pt", padding=True, truncation=True).to(model.device)
+                
+                print("6")
+                with torch.no_grad():
+                    outputs = model(**inputs)
+                print("7")
+            
+                # 2. Robust Mean Pooling (Using Attention Mask)
+                last_hidden = outputs.last_hidden_state
+                attention_mask = inputs['attention_mask']
+            
+                # Expand mask to match hidden state shape [Batch, Seq, Dim]
+                input_mask_expanded = attention_mask.unsqueeze(-1).expand(last_hidden.size()).float()
+            
+                # Sum the visible tokens and divide by the sum of the mask
+                sum_embeddings = torch.sum(last_hidden * input_mask_expanded, 1)
+                sum_mask = torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+                chunk_val = sum_embeddings / sum_mask
+            
+                # 3. Normalize to Unit Hypersphere
+                # Essential for your bit-plane range stability
+                chunk_val = F.normalize(chunk_val, p=2, dim=1)
+            
+                embeddings.append(chunk_val.cpu().numpy())
+            
+                rows += 1
+                if(rows >= NUM_ROWS):
+                    break
+            return np.vstack(embeddings)
+            #embedding = model.encode(text_lines, batch_size=1, convert_to_numpy=True)
+            #if(len(embedding.shape) == 1):
+                #embedding = embedding.reshape(1,embedding.shape[0])
+            #return embedding
+        elif(CHUNKING_MODE == False):
+            #force to CPU to avoid the "Memory not initialized" iGPU/Vulkan error
+            print("1")
+            model.eval()
+            #1. tokenize everything into one giant list of IDs. Turn off add_special_tokens so we can handle [CLS]/[SEP] manually
+            all_ids = []
+            prefix = "search_document:" #this is required for nomic to give accurate RAG compression results
+            for t in text[:NUM_LINES]:
+                full_text = prefix + t
+                all_ids.extend(tokenizer.encode(full_text, add_special_tokens=False))
+        
+            #2. define payload size (context_len - 2 for CLS and SEP)
+            payload_size = context_n - 2
+        
+            #3. create chunks of exactly payload_size
+            #we drop the last chunk if it's incomplete to keey your data "pure"
+            print("3")
+            chunks = [all_ids[i : i + payload_size] for i in range(0, len(all_ids), payload_size) if len(all_ids[i : i + payload_size]) == payload_size]
+            print("4")
+        
+            #4. generate embeddings
+            embeddings = []
+            print(len(all_ids))
+            rows = 0
+            for chunk in chunks:
+                #5. add the structural anchors for nomic/BERT
+                # [101] = CLS, [102] = SEP
+                print("5")
+                full_chunk = [[101] + chunk + [102]]
+                input_ids = torch.tensor(full_chunk).to(model.device)
+                attention_mask = torch.ones((1, len(full_chunk))).to(model.device)
+                input_dict = {"input_ids": input_ids, "attention_mask": attention_mask}
+                print("6")
+                with torch.no_grad():
+                    outputs = model(**input_dict)
+                print("7")
+            
+                #6. mean pooling: average the hidden states
+                last_hidden = outputs.last_hidden_state
+                print("before dim1")
+                chunk_val = torch.mean(last_hidden, dim=1)
+            
+                #7. normalize to the unit hypersphere (standard for RAG/Nomic)
+                print("before dim2")
+                chunk_val = torch.nn.functional.normalize(chunk_val, p=2, dim=1)
+                embeddings.append(chunk_val.cpu().numpy())
+            
+                rows += 1
+                if(rows >= NUM_ROWS):
+                    break
+            return np.vstack(embeddings)
+    
     # TRANSFORMERS MODELS (Sentence-Transformers)
     elif model_name in ["bge-m3", "e5-large-v2"]:
         from sentence_transformers import SentenceTransformer
+        import torch
         hf_id = {"bge-m3": "BAAI/bge-m3", "e5-large-v2": "intfloat/e5-large-v2"}[model_name]
         # SentenceTransformer handles local caching automatically
         model = SentenceTransformer(hf_id, cache_folder=str(model_dir))
-        inputs = model.tokenize([text])
-        device = next(model.parameters()).device
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-        with torch.no_grad():
-            output = model[0](inputs)
-            raw_matrix = output['token_embeddings']
-        return np.array(raw_matrix[0].to("cpu"))
+        model.gradient_checkpointing_enable() #memory optimization, slightly reduces speed
+        query_overhead = 0 #certain datasets need this
+        if(model_name == "e5-large-v2"):
+            query_overhead = len(model.tokenizer.encode("passage:", add_special_tokens=False))
+        if(CHUNKING_MODE == True):
+            text = text[:NUM_LINES]
+            #try ruis new method
+            text_lines = []
+            tokenizer = model.tokenizer
+            budget = context_n - query_overhead - 2 #tries to not account for special tokens
+            for line in text:
+                tokens = tokenizer.encode(line, add_special_tokens=False)
+                if(len(tokens) <= budget):
+                    text_lines.append(line)
+                else:
+                    for i in range(0, len(tokens), budget):
+                        chunk = tokens[i : i + budget]
+                        # 3. Decode back to text so ST can re-tokenize it with special tokens
+                        decoded_chunk = tokenizer.decode(chunk, skip_special_tokens=True)
+                        text_lines.append(decoded_chunk)
+                del tokens
+            #
+            if(model_name == "e5-large-v2"):
+                text_lines = ["passage:" + t for t in text_lines]
+            embedding = model.encode(text_lines, batch_size=1, convert_to_numpy=True)
+            if(len(embedding.shape) == 1):
+                embedding = embedding.reshape(1,embedding.shape[0])
+            return embedding
+        elif((CHUNKING_MODE == False) and (pooling_mode == 0)):
+            text = text[:NUM_LINES]
+            inputs = model.tokenize([text])
+            device = next(model.parameters()).device
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+            with torch.no_grad():
+                output = model[0](inputs)
+                raw_matrix = output['token_embeddings']
+            return np.array(raw_matrix[0].to("cpu"))
+        elif((CHUNKING_MODE == False) and (pooling_mode == 1)): #mainly for e5
+            tokenizer = model.tokenizer
+            text = text[:NUM_LINES]
+            full_ids = []
+            for t in text:
+                full_text = t + "passage: " #e5 is sensitive to prefixes
+                full_ids.extend(tokenizer.encode(full_text, batch_size=1, add_special_tokens=False))
+            #create chunks of text strings
+            chunks = [full_ids[i : i + max_context] for i in range(0, len(full_ids), context_n)]
+            #convert IDs back to strings so .encode() can handle them
+            processed_chunks = [tokenizer.decode(c) for c in chunks if len(c) == context_n]
+            #now do the embedding
+            if(ACCELERATION_DEVICE == "xpu"):
+                torch.xpu.empty_cache()
+            elif(ACCELERATION_DEVICE == "cuda"):
+                torch.cuda.empty_cache()
+            embedding = model.encode(processed_chunks, convert_to_numpy=True)
+            #return result
+            return embedding
+        elif((CHUNKING_MODE == False) and (pooling_mode == 2)): #mainly for BAAI-BGE-M3
+            #1. use BGE-M3 tokenizer to wrap into 8190 token chunks
+            tokenizer = model.tokenizer
+            text = text[:NUM_LINES]
+            full_ids = []
+            for t in text:
+                full_ids.extend(tokenizer.encode(t, batch_size=1, add_special_tokens=False))
+            print(len(full_ids))
+            #create chunks of text strings
+            chunks = [full_ids[i : i + max_context] for i in range(0, len(full_ids), context_n)]
+            #convert IDs back to strings so .encode() can handle them
+            processed_chunks = [tokenizer.decode(c) for c in chunks if len(c) == context_n]
+            #now do the embedding
+            if(ACCELERATION_DEVICE == "xpu"):
+                torch.xpu.empty_cache()
+            elif(ACCELERATION_DEVICE == "cuda"):
+                torch.cuda.empty_cache()
+            embedding = model.encode(processed_chunks, batch_size=1, convert_to_numpy=True, normalize_embeddings=True)
+            #now return the results
+            return embedding
 
     #note: these others below are not going to be used
     # API MODELS
@@ -138,8 +541,9 @@ def generate_local_embeddings(text, model_name):
     # 4. GOOGLE GEMINI (API-based)
     elif model_name == "gemini-2":
         import google.generativeai as genai
+        Google_api_key = str(input("Enter your Google API Key: "))
         # Requires GOOGLE_API_KEY env variable
-        genai.configure(api_key=os.environ["GOOGLE_API_KEY"])
+        genai.configure(api_key=os.environ[Google_api_key])
         # 'models/text-embedding-004' or the new 'gemini-embedding-2-preview'
         result = genai.embed_content(
             model="models/gemini-embedding-2-preview",
@@ -151,10 +555,11 @@ def generate_local_embeddings(text, model_name):
     # 5. NVIDIA NV-EMBED (Local via Transformers or NIM API)
     elif model_name == "nv-embed-v2":
         # Strategy A: Using NVIDIA's API (NIM)
+        nvidia_api_key = str(input("Enter your Nvidia API Key: "))
         from openai import OpenAI # NVIDIA NIM uses OpenAI-compatible headers
         client = OpenAI(
             base_url="https://integrate.api.nvidia.com/v1",
-            api_key=os.environ["NVIDIA_API_KEY"]
+            api_key=os.environ[nvidia_api_key]
         )
         response = client.embeddings.create(
             input=[text],
@@ -169,6 +574,7 @@ def generate_local_embeddings(text, model_name):
         model = SentenceTransformer("nvidia/llama-nemotron-embed-1b-v2", cache_folder=str(model_dir))
         return model.encode(text)
     pass
+    '''
 
 def extract_vectors(file_path, vector_column_name='embeddings'):
     import os
@@ -277,6 +683,8 @@ def extract_vectors(file_path, vector_column_name='embeddings'):
         
         # 7. .txt (Create the vector embedding yourself)
         elif ext == '.txt':
+            return embedding_model_selection(file_path, "", ".txt")
+            '''
             text = open(file_path, 'r', encoding='utf-8').read()
             #print(text)
             framedata = [[4096, 40960, "Alibaba Group", "Quite advanced"],[3072, 8192, "OpenAI", "Used in ChatGPT"],[4096, 32768, "Microsoft", "Used in Bing Search, and Even Copilot and RAG applications"],[1024, 512, "Microsoft", "Warning: pretty low token range"],[1024, 8192, "Beijing Academy of Artificial Intelligence", ""],[768,8192, "Nomic AI", "new, and focused on performance"],[4096,32768, "Nvidia", "Based on E5 Mistral 7B, optimized for performance and accuracy. Typically used in research rather than industry."],[2048,8192, "Nvidia", "Custom Nemotron architecture, good for efficiency"],[3072,8192, "Google", "Used in Google Gemini Models."]]
@@ -292,6 +700,7 @@ def extract_vectors(file_path, vector_column_name='embeddings'):
             
             options = ["qwen3","openai-3-large","e5-mistral","e5-large-v2","bge-m3","nomic","nv-embed-v2","nemotron-embed","gemini-2"]
             return generate_local_embeddings(text, options[choice])
+            '''
         
         # 8. .arrow or .feather; extremelly rare, but huggingface datasets sometimes use this
         elif ext == '.arrow' or ext == '.feather':
@@ -306,6 +715,195 @@ def extract_vectors(file_path, vector_column_name='embeddings'):
     except Exception as e:
         print(f"Error extracting from {ext}: {e}")
         return None
+
+def embedding_model_selection(file_path, Text, mode):
+    import os
+    import numpy as np
+    import pandas as pd
+    
+    if(mode == ".txt"):
+        text = open(file_path, 'r', encoding='utf-8').read()
+    elif(mode == "dataset"):
+        text = Text
+    
+    pool_mapping = {"qwen3": 2, "openai-3-large": 1, "e5-mistral": 2, "e5-large-v2": 1, "bge-m3": 2, "nomic": 1, "nv-embed-v2": 0, "nemotron-embed": 0, "gemini-2": 1, "gemma-2": 1, "snowflake-arctic-embed-v2.0": 2}
+    dim_mapping = {"qwen3": 4096, "openai-3-large": 3072, "e5-mistral": 4096, "e5-large-v2": 1024, "bge-m3": 1024, "nomic": 768, "nv-embed-v2": 4096, "nemotron-embed": 2048, "gemini-2": 3072, "gemma-2": 3584, "snowflake-arctic-embed-v2.0": 1024}
+    context_mapping = {"qwen3": 40960, "e5-mistral": 32768, "e5-large-v2": 512, "bge-m3": 8192, "nomic": 8192, "gemma-2": 8192, "snowflake-arctic-embed-v2.0": 8192}
+    native_context_mapping = {"qwen3": 32768, "e5-mistral": 4096, "e5-large-v2": 512, "bge-m3": 8192, "nomic": 2048, "gemma-2": 8192, "snowflake-arctic-embed-v2.0": 8192}
+    datatype_mapping = {"qwen3": np.float16, "e5-mistral": np.float16, "e5-large-v2": np.float32, "bge-m3": np.float16, "nomic": np.float32, "gemma-2": np.float16, "snowflake-arctic-embed-v2.0": np.float32}
+    #print(text)
+    framedata = [[4096, 40960, 32768, "CLS", "Alibaba Group", "Quite advanced"],[4096, 32768, 4096, "CLS", "Microsoft", "Used in Bing Search, and Even Copilot and RAG applications"],[1024, 512, 512, "Mean", "Microsoft", "Warning: pretty low token range"],[1024, 8192, 8192, "CLS", "Beijing Academy of Artificial Intelligence", ""],[768, 8192, 2048, "Mean", "Nomic AI", "new, and focused on performance"], [3584, 8192, 8192, "Mean(Adaptive)", "Google", "Open Source version of Google Gemini Embedding model"], [1024, 8192, 8192, "CLS", "Snowflake", "Commonly used for large-scale RAG in industry"]]
+    df = pd.DataFrame(np.array(framedata))
+    df.columns = ['Maximum Dims:','Maximum # Tokens:', 'Native Token Context:', 'Pooling Type:', 'Source:', 'Notes:']
+    df.index = ['0.) Qwen3 Embedding 8B (FP16): ', '1.) E5 Mistral 7B (FP16): ', '2.) E5 Large V2 (FP32): ', '3.) BAAI BGE-M3 (FP16): ', '4.) Nomic Embed V1.5 (FP32): ', '5.) Gemma 2 Embedding 9B (FP16):', '6.) Snowflake Arctic Embedding L V2.0 (FP32):'] #rows
+    pd.set_option('display.max_columns', None)
+    pd.set_option('display.width', 150)
+    print(df)
+    choice = int(input("Enter your number choice here: "))
+            
+    options = ["qwen3","e5-mistral","e5-large-v2","bge-m3","nomic","gemma-2","snowflake-arctic-embed-v2.0"]
+    print("before generating local embeddings")
+    
+    #text formatting by pooling type
+    '''
+    pool_map = pool_mapping[options[choice]]
+    if(pool_map == 0): #by token
+        pass
+    elif(pool_map == 1): #average by row
+        pass
+    elif(pool_map == 2): #CLS / last token
+        pass
+    '''
+    BERT = False
+    BERT_LIST = ['nomic']
+    if(options[choice] in BERT_LIST):
+        BERT = True
+    return generate_local_embeddings(text, options[choice], pool_mapping[options[choice]], dim_mapping[options[choice]], context_mapping[options[choice]], native_context_mapping[options[choice]], BERT, datatype_mapping[options[choice]])
+
+def dataset_embedding(file_path):
+    import os
+    import numpy as np
+    import pandas as pd
+    import json
+    import zstandard as zstd
+    import ml_dtypes
+    import pyarrow.feather as feather
+    """
+    Extracts vector data from various file formats and returns a NumPy array.
+    """
+    ext = os.path.splitext(file_path)[-1].lower()
+    print(f"--- Processing {ext} file ---")
+
+    try:
+        # 1. NumPy Files (Pure numerical data)
+        if ext == '.npy':
+            return np.load(file_path)
+        
+        # 2. Parquet Files (Common for Large Datasets)
+        elif ext == '.parquet':
+            df = pd.read_parquet(file_path)
+            print(".parquet KEYS --> Values: ")
+            i = 0
+            for k in df.keys():
+                print(str(i) + ".) " + str(k) + " --> " + str(df[k].values))
+                i += 1
+            selec = int(input("Select the column to choose by number: "))
+            text = df[df.keys()[selec]].values
+            print("Before selecting embedding model")
+            return embedding_model_selection(file_path, text, "dataset")
+
+        # 3. JSON Lines (Common for API exports like OpenAI)
+        elif ext == '.jsonl':
+            vectors = []
+            with open(file_path, 'r') as f:
+                for line in f:
+                    data = json.loads(line)
+                    # Adjust 'embedding' key based on your specific JSON structure
+                    print("JSONL KEYS: ")
+                    print(data.keys())
+                    vectors.append(data[vector_column_name])
+            return np.array(vectors)
+        elif(file_path.endswith('.jsonl.zst')):
+            vectors = []
+            dctx = zstd.ZstdDecompressor()
+            with open(file_path, 'rb') as fh:
+                # Create a stream reader to decompress on the fly
+                with dctx.stream_reader(fh) as reader:
+                    # Wrap the binary stream in a text-mode wrapper
+                    import io
+                    text_stream = io.TextIOWrapper(reader, encoding='utf-8')
+                    for line in text_stream:
+                        if line.strip():
+                            data = json.loads(line)
+                            print("JSONL.ZST KEYS: ")
+                            print(data.keys())
+                            col = _find_vector_column(data)
+                            print(f"Autodetected vector column: '{col}'")
+                            vectors.append(data[col])
+            return np.array(vectors)
+        elif(file_path.endswith('.jsonl.offsets')):
+            jsonl_path = file_path.replace('.offsets', '')
+            # Read offsets (usually stored as 8-byte integers)
+            offsets = np.fromfile(file_path, dtype=np.int64)
+        
+            # Example: Extracting the first NUM_ROWS vectors using offsets
+            vectors = []
+            with open(jsonl_path, 'r') as f:
+                for off in offsets[:NUM_ROWS]:
+                    f.seek(off)
+                    line = f.readline()
+                    print("JSONL.OFFSETS KEYS: ")
+                    print(json.loads(line).keys())
+                    vectors.append(json.loads(line)[vector_column_name])
+            return np.array(vectors)
+
+        # 4. CSV Files (Text-heavy/Debug formats)
+        elif ext == '.csv': #don't use this either
+            df = pd.read_csv(file_path)
+            # CSV vectors are often stored as strings like "[0.1, 0.2...]"
+            # This converts those strings back into actual lists/arrays
+            print([df.iloc[i] for i in range(8)])
+            key = _find_vector_column(df.iloc[0])
+            #print("CSV KEYS: ")
+            #print(df.keys())
+            if isinstance(df[key].iloc[0], str):
+                df[key] = df[key].apply(json.loads)
+            return np.stack(df[key].values)
+
+        # 5. SafeTensors (Modern Model Weights)
+        elif ext == '.safetensors': #don't use this at all. It is more for model weights than vector embeddings
+            from safetensors.numpy import load_file
+            tensors = load_file(file_path)
+            # Safetensors usually have multiple keys; we return the first one or a specific one
+            #key = list(tensors.keys())[0]
+            print(tensors)
+            key = _find_vector_column(tensors)
+            print(f"Extracted key: {key}")
+            return tensors[key]
+
+        # 6. HDF5 (Scientific Data)
+        elif ext in ['.h5', '.hdf5']:
+            import h5py
+            with h5py.File(file_path, 'r') as f:
+                # Assuming vectors are in a dataset named 'vectors'
+                key = 'vectors' if 'vectors' in f else list(f.keys())[0]
+                return np.array(f[key])
+        
+        # 7. .txt (Create the vector embedding yourself)
+        elif ext == '.txt':
+            return embedding_model_selection(file_path, "", ".txt")
+            '''
+            text = open(file_path, 'r', encoding='utf-8').read()
+            #print(text)
+            framedata = [[4096, 40960, "Alibaba Group", "Quite advanced"],[3072, 8192, "OpenAI", "Used in ChatGPT"],[4096, 32768, "Microsoft", "Used in Bing Search, and Even Copilot and RAG applications"],[1024, 512, "Microsoft", "Warning: pretty low token range"],[1024, 8192, "Beijing Academy of Artificial Intelligence", ""],[768,8192, "Nomic AI", "new, and focused on performance"],[4096,32768, "Nvidia", "Based on E5 Mistral 7B, optimized for performance and accuracy. Typically used in research rather than industry."],[2048,8192, "Nvidia", "Custom Nemotron architecture, good for efficiency"],[3072,8192, "Google", "Used in Google Gemini Models."]]
+            df = pd.DataFrame(np.array(framedata))
+            df.columns = ['Maximum Dims:','Maximum # Tokens:', 'Source:', 'Notes:']
+            df.index = ['0.) Qwen3 Embedding 8B FP16: ', '1.) OpenAI V3 Large: ', '2.) E5 Mistral 7B FP16: ', '3.) E5 Large V2: ', '4.) BAAI BGE-M3: ', '5.) Nomic Embed V1.5 FP32: ', '6.) NV-Embed V2: ', '7.) Llama Nemotron Embedding 1B: ', '8.) Gemini Embedding 2'] #rows
+            pd.set_option('display.max_columns', None)
+            pd.set_option('display.width', 150)
+            print(df)
+            print("NOTE: These embedding models won't work properly, due to either being paid, requiring API keys, or not running locally:")
+            print("1.) OpenAI V3 Large\n6.) NV-Embed V2\n7.) Llama Nemotron Embedding 1B\n8.) Gemini Embedding 2\n")
+            choice = int(input("Enter your number choice here: "))
+            
+            options = ["qwen3","openai-3-large","e5-mistral","e5-large-v2","bge-m3","nomic","nv-embed-v2","nemotron-embed","gemini-2"]
+            return generate_local_embeddings(text, options[choice])
+            '''
+        
+        # 8. .arrow or .feather; extremelly rare, but huggingface datasets sometimes use this
+        elif ext == '.arrow' or ext == '.feather':
+            df = feather.read_feather(file_path)
+            key = _find_vector_column(df.iloc[0])
+            return np.stack(df[key].values)
+
+        else:
+            print(f"Unsupported extension: {ext}")
+            return None
+
+    except Exception as e:
+        print(f"Error extracting from {ext}: {e}")
+        return None
+    pass
 
 #Step 1+2: Vector Embedding Input Normalization (to -1 to 1, with norm of 1)(if not already normalized) + Quantization (Assymetric Scalar Quantization or Symmetric Scalar Quantization)
 #normalization
@@ -323,7 +921,7 @@ def normalize(np_emb):
         verify = numpy.mean(numpy.linalg.norm(normalizedembeddings, axis=1))
         if((verify >= 0.999) and (verify <= 1.001)):
             return normalizedembeddings
-        print("Not normalized. Normalization failed.")
+        print("Not normalized. Normalization failed. The mean deviation is: " + str(verify))
         return normalizedembeddings
 
 #quantization functions
@@ -476,7 +1074,10 @@ def pack_bits(tensor_r): #NOTE: both of these modes are confirmed correct and wo
     """
     import torch
     #clear xpu memory: this is especially important for very large tensors that fill your VRAM
-    torch.xpu.empty_cache()
+    if(ACCELERATION_DEVICE == "xpu"):
+        torch.xpu.empty_cache()
+    elif(ACCELERATION_DEVICE == "cuda"):
+        torch.cuda.empty_cache()
     stats = torch.xpu.memory_stats()
     print(f"Allocated: {stats['allocated_bytes.all.current'] / 1024**3:.2f} GB")
     print(f"Reserved: {stats['reserved_bytes.all.current'] / 1024**3:.2f} GB")
@@ -598,7 +1199,10 @@ def bitplane_compression_benchmark(tensor_d, title): #replaces run_phased_benchm
     import lz4.frame
     
     #clear xpu memory: this is especially important for very large tensors that fill your VRAM
-    torch.xpu.empty_cache()
+    if(ACCELERATION_DEVICE == "xpu"):
+        torch.xpu.empty_cache()
+    elif(ACCELERATION_DEVICE == "cuda"):
+        torch.cuda.empty_cache()
     
     #if the original input is not a tensor, convert it to a tensor
     if(torch.is_tensor(tensor_d) == False):
@@ -886,7 +1490,10 @@ def RLE_bitplane_compressibility(matrix, title):
     import torch
     import numpy
     #clear xpu memory: this is especially important for very large tensors that fill your VRAM
-    torch.xpu.empty_cache()
+    if(ACCELERATION_DEVICE == "xpu"):
+        torch.xpu.empty_cache()
+    elif(ACCELERATION_DEVICE == "cuda"):
+        torch.cuda.empty_cache()
     #we need to standardize input to tensor form (no numpy.ndarrays)
     MAT = matrix
     if(isinstance(matrix, numpy.ndarray)):
@@ -938,14 +1545,18 @@ def run_simulation():
     while(ind < len(files)):
         print(str(ind) + ".) " + str(files[ind]))
         ind += 1
-    print("\nNOTE: You must make sure that the file you are choosing is a pre-computed non-compressed vector embedding of numeric values, (or else the program will fail)\n")
+    #print("\nNOTE: You must make sure that the file you are choosing is a pre-computed non-compressed vector embedding of numeric values, (or else the program will fail)\n")
     ms = int(input("Input path number here: "))
     testfile = files[ms]
     #join it together
     global file_path
     file_path = os.path.join(base_directory, testfile)
     #print(file_path)
-    result = extract_vectors(file_path)
+    computation_choice = str(input("Is this data precomputed?[Y/N]: ")).lower()
+    if(computation_choice == "y"):
+        result = extract_vectors(file_path)
+    elif(computation_choice == "n"):
+        result = dataset_embedding(file_path)
     if(PRINT_ORIGINAL == True):
         print("\nORIGINAL VECTOR EMBEDDING DATA: " + str(result.shape))
         print(result)
