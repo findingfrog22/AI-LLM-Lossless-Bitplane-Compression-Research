@@ -1,6 +1,0 @@
-To do 3_21+_26: (B0.8.5 - Beta)(FinalSimulation.py)
-- Add an option to only do compression analytics on the first few MSBs (controllable with settings)(brings it closer to TRACE)
-- Test on more datasets
-- (maybe?) add some more metrics: (brings it closer to TRACE)
-	- bandwidth savings
-	- compression timing/latency
