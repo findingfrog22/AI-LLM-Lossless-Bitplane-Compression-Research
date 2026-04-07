@@ -129,7 +129,7 @@ def _find_vector_column(sample_row):
             
     raise ValueError("Could not automatically detect a vector column.")
 
-def generate_local_embeddings(text, model_name, pooling_mode, dim_count, max_context, native_context, bert, data_type):
+def generate_local_embeddings(text, model_name, pooling_mode, dim_count, max_context, native_context, data_type, prefix):
     import os
     import json
     import io
@@ -203,518 +203,68 @@ def generate_local_embeddings(text, model_name, pooling_mode, dim_count, max_con
                 text = [text]
             #print("print2")
             total_text = text[:NUM_LINES]
-            #NOTE FOR 4/2+: You need to account for when lines are too long or too short
+            #done, rui's method now works for xpu chunking mode = true
+            #TO DO for 4/8+: add ruis chunking mode for non-xpu devices, then add your wrapping chunking mode for both xpu and non-xpu
             full_text = []
             if(ACCELERATION_DEVICE == "xpu"): #xpu sycl library has a quirk where it can only embed 1 string line at a time
-                '''
-                if(CHUNKING_MODE == True):
+                if(CHUNKING_MODE == True): #does the sentence wrapping only when too long
                     for line in total_text:
-                        tokens = engine.tokenize(line.encode('utf-8'))
+                        if(prefix != 'None'):
+                            line = prefix + line
+                        tokens = engine.tokenize(line.encode('utf-8'), add_bos=False)
                         if(len(tokens) > context_n):
-                            engine.reset()
-                            res = engine.embed(tokens)
-                            full_text.append(np.array(res[0], dtype=data_type))
-                            #full_text.append(engine.create_embedding(input=tokens)['data'][0]['embedding'])
-                        else:
                             for i in range(0, len(tokens), context_n):
                                 engine.reset()
-                                res = engine.embed(tokens[i:i+context_n])
-                                full_text.append(np.array(res[0], dtype=data_type))
-                                #full_text.append(engine.create_embedding(input=tokens[i:i+context_n])['data'][0]['embedding'])
-                        return np.array(full_text, dtype=data_type)
-                '''
-                vectors = [engine.create_embedding(line)['data'][0]['embedding'] for line in total_text]
-                return np.array(vectors, dtype=data_type)
+                                res = np.array(engine.embed(engine.detokenize(tokens[i : i + context_n]).decode('utf-8', errors='replace')), dtype=data_type)
+                                if(res.ndim > 1):
+                                    res = res.ravel()
+                                full_text.append(res)
+                        else:
+                            engine.reset()
+                            res = np.array(engine.embed(line), dtype=data_type)
+                            if(res.ndim > 1):
+                                res = res.ravel()
+                            full_text.append(res)
+                    return np.vstack(full_text, dtype=data_type)
+                elif(CHUNKING_MODE == False): #still need to adjust this one
+                    text = ''.join(text[:NUM_LINES])
+                    vectors = engine.create_embedding(text)['data'][0]['embedding']
+                    #vectors = [engine.create_embedding(line)['data'][0]['embedding'] for line in total_text]
+                    return np.array(vectors, dtype=data_type)
             else: #other backends can do all the embeddings at once
-                response = engine.create_embedding(total_text)
-                vectors = [row['embedding'] for row in response['data']]
-                return np.array(vectors, dtype=data_type)
-        elif(pooling_mode == 0):
-            text = ''.join(text[:NUM_ROWS])
-        return np.array(engine.create_embedding(text)['data'][0]['embedding'])
-    
-
-def generate_local_embeddings0(text, model_name, pooling_mode, dim_count, max_context, native_context, bert):
-    import os
-    import json
-    import io
-    import numpy as np
-    import pandas as pd
-    import zstandard as zstd
-    from pathlib import Path
-    import sentence_transformers
-    """Checks local 'models' folder, downloads if missing, and runs inference."""
-    script_dir = Path(__file__).parent.resolve()
-    model_dir = script_dir / "models"
-    model_dir.mkdir(exist_ok=True)
-    
-    #allows the arc IGPU to use more vram than 4GB
-    if(ACCELERATION_DEVICE == "xpu"):
-        oneapi_path = r"C:\Program Files (x86)\Intel\oneAPI\compiler\latest\bin"
-        os.environ["PATH"] = oneapi_path + os.pathsep + os.environ["PATH"]
-        # Force the level_zero driver to select the GPU (iGPU/Arc)
-        os.environ["ONEAPI_DEVICE_SELECTOR"] = "level_zero:gpu"
-        # Optional: Helps with task submission performance on Arc
-        os.environ["SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS"] = "1"
-        os.environ["GGML_SYCL_DEBUG"] = "1"
-        os.environ["SYCL_UR_USE_LEVEL_ZERO_V2"] = "1"
-        os.environ["UR_L0_USE_RELAXED_ALLOCATION_LIMITS"] = "1"
-        os.environ["ZES_ENABLE_SYSMAN"] = "1"
-        os.environ["GGML_SYCL_DEVICE"] = "0" # Forces the first Intel GPU
-    
-    #sets up some parameters
-    if(TOKEN_CONTEXT == -1):
-        context_n = native_context
-    else:
-        context_n = min(TOKEN_CONTEXT, max_context)
-
-    # GGUF MODELS (Llama-cpp-python) #removed nomic from GGUF models, as it causes compatibility issues with certain backends, like vulkan
-    if model_name in ["qwen3", "e5-mistral", "nomic"]:
-        from llama_cpp import Llama
-        from huggingface_hub import hf_hub_download
-        import llama_cpp
-        
-        configs = {
-            "qwen3": ("Qwen/Qwen3-Embedding-8B-GGUF", "Qwen3-Embedding-8B-f16.gguf"),
-            "e5-mistral": ("dranger003/e5-mistral-7b-instruct-GGUF", "ggml-e5-mistral-7b-instruct-f16.gguf"),
-            "nomic": ("nomic-ai/nomic-embed-text-v1.5-GGUF", "nomic-embed-text-v1.5.f32.gguf")
-        }
-        #original e5-mistral: ("intfloat/e5-mistral-7b-instruct", "e5-mistral-7b-instruct-f16.gguf")
-        repo, filename = configs[model_name]
-        m_path = hf_hub_download(repo_id=repo, filename=filename, local_dir=str(model_dir))
-        
-        #setting up engine parameters
-        engine = Llama(model_path=m_path, embedding=True, flash_attn=False, logits_all=True, pooling_type=pooling_mode, n_parallel=4, n_gpu_layers=-1, main_gpu=0, use_mmap=False, n_ctx=context_n, n_batch=BATCH_SIZE, n_ubatch=BATCH_SIZE, verbose=True)
-        
-        if((pooling_mode == 1) or (pooling_mode == 2)):
-            #text = ''.join(text[:NUM_ROWS])
-            all_results = []
-            #print("print1")
-            if(isinstance(text, np.ndarray)):
-                text = text.tolist()
-            elif(isinstance(text, str)):
-                text = [text]
-            #print("print2")
-            total_text = text[:NUM_LINES]
-            #print(total_text)
-            #print("print3")
-            response = engine.create_embedding(total_text)
-            #print("print4")
-            vectors = [row['embedding'] for row in response['data']]
-            #print("print5")
-            return np.array(vectors)
-            #for i in range(0, NUM_ROWS):
-                #batch = text[i]
-                #response = engine.create_embedding(batch)
-                #vectors = [row['embedding'] for row in response['data']]
-                #all_results.append(vectors)
-            #return np.vstack(all_results)
-            '''
-            text = text[:NUM_ROWS]
-            return np.vstack(engine.create_embedding(text)['data'][0]['embedding'])
-            '''
-        elif(pooling_mode == 0):
-            text = ''.join(text[:NUM_ROWS])
-        return np.array(engine.create_embedding(text)['data'][0]['embedding'])
-    
-    #
-    '''
-    elif model_name in ["nomic"]:
-        from transformers import AutoModel, AutoTokenizer
-        import torch.nn.functional as F
-        import torch
-        import numpy as np
-        import einops
-        if(isinstance(text, np.ndarray)):
-            text = text.tolist()
-        elif(isinstance(text, str)):
-            text = text.split("\n")
-            text = [t + "\n" for t in text]
-        #0. set up the model and tokenizer
-        tokenizer = AutoTokenizer.from_pretrained("nomic-ai/nomic-embed-text-v1.5", trust_remote_code=True)
-        model = AutoModel.from_pretrained("nomic-ai/nomic-embed-text-v1.5", trust_remote_code=True)
-        if(CHUNKING_MODE == True):
-            model.eval()
-            text = text[:NUM_LINES]
-            text_lines = []
-            prefix = "search_document:"
-            prefix_overhead = len(tokenizer.encode(prefix, add_special_tokens=False))
-            budget = context_n - prefix_overhead - 2
-            for line in text:
-                print("Before")
-                tokens = tokenizer.encode(line, add_special_tokens=False)
-                print("After")
-                if(len(tokens) <= budget):
-                    text_lines.append(line)
-                else:
-                    for i in range(0, len(tokens), budget):
-                        chunk = tokens[i : i + budget]
-                        # 3. Decode back to text so ST can re-tokenize it with special tokens
-                        decoded_chunk = tokenizer.decode(chunk, skip_special_tokens=True)
-                        text_lines.append(decoded_chunk)
-                del tokens
-            text_lines = [prefix + t for t in text_lines] #add the prefix, makes it more accurate
-            embeddings = []
-            #print(len(all_ids))
-            rows = 0
-            for chunk in text_lines:
-                #5. add the structural anchors for nomic/BERT
-                # [101] = CLS, [102] = SEP
-                print("5")
-                # This handles the [101] and [102] (CLS/SEP) automatically
-                inputs = tokenizer(chunk, return_tensors="pt", padding=True, truncation=True).to(model.device)
+                if(CHUNKING_MODE == True): #not tested yet
+                    full_text = []
+                    for line in total_text:
+                        if(prefix != 'None'):
+                            line = prefix + line
                 
-                print("6")
-                with torch.no_grad():
-                    outputs = model(**inputs)
-                print("7")
-            
-                # 2. Robust Mean Pooling (Using Attention Mask)
-                last_hidden = outputs.last_hidden_state
-                attention_mask = inputs['attention_mask']
-            
-                # Expand mask to match hidden state shape [Batch, Seq, Dim]
-                input_mask_expanded = attention_mask.unsqueeze(-1).expand(last_hidden.size()).float()
-            
-                # Sum the visible tokens and divide by the sum of the mask
-                sum_embeddings = torch.sum(last_hidden * input_mask_expanded, 1)
-                sum_mask = torch.clamp(input_mask_expanded.sum(1), min=1e-9)
-                chunk_val = sum_embeddings / sum_mask
-            
-                # 3. Normalize to Unit Hypersphere
-                # Essential for your bit-plane range stability
-                chunk_val = F.normalize(chunk_val, p=2, dim=1)
-            
-                embeddings.append(chunk_val.cpu().numpy())
-            
-                rows += 1
-                if(rows >= NUM_ROWS):
-                    break
-            return np.vstack(embeddings)
-            #embedding = model.encode(text_lines, batch_size=1, convert_to_numpy=True)
-            #if(len(embedding.shape) == 1):
-                #embedding = embedding.reshape(1,embedding.shape[0])
-            #return embedding
-        elif(CHUNKING_MODE == False):
-            #force to CPU to avoid the "Memory not initialized" iGPU/Vulkan error
-            print("1")
-            model.eval()
-            #1. tokenize everything into one giant list of IDs. Turn off add_special_tokens so we can handle [CLS]/[SEP] manually
-            all_ids = []
-            prefix = "search_document:" #this is required for nomic to give accurate RAG compression results
-            for t in text[:NUM_LINES]:
-                full_text = prefix + t
-                all_ids.extend(tokenizer.encode(full_text, add_special_tokens=False))
-        
-            #2. define payload size (context_len - 2 for CLS and SEP)
-            payload_size = context_n - 2
-        
-            #3. create chunks of exactly payload_size
-            #we drop the last chunk if it's incomplete to keey your data "pure"
-            print("3")
-            chunks = [all_ids[i : i + payload_size] for i in range(0, len(all_ids), payload_size) if len(all_ids[i : i + payload_size]) == payload_size]
-            print("4")
-        
-            #4. generate embeddings
-            embeddings = []
-            print(len(all_ids))
-            rows = 0
-            for chunk in chunks:
-                #5. add the structural anchors for nomic/BERT
-                # [101] = CLS, [102] = SEP
-                print("5")
-                full_chunk = [[101] + chunk + [102]]
-                input_ids = torch.tensor(full_chunk).to(model.device)
-                attention_mask = torch.ones((1, len(full_chunk))).to(model.device)
-                input_dict = {"input_ids": input_ids, "attention_mask": attention_mask}
-                print("6")
-                with torch.no_grad():
-                    outputs = model(**input_dict)
-                print("7")
-            
-                #6. mean pooling: average the hidden states
-                last_hidden = outputs.last_hidden_state
-                print("before dim1")
-                chunk_val = torch.mean(last_hidden, dim=1)
-            
-                #7. normalize to the unit hypersphere (standard for RAG/Nomic)
-                print("before dim2")
-                chunk_val = torch.nn.functional.normalize(chunk_val, p=2, dim=1)
-                embeddings.append(chunk_val.cpu().numpy())
-            
-                rows += 1
-                if(rows >= NUM_ROWS):
-                    break
-            return np.vstack(embeddings)
-    
-    # TRANSFORMERS MODELS (Sentence-Transformers)
-    elif model_name in ["bge-m3", "e5-large-v2"]:
-        from sentence_transformers import SentenceTransformer
-        import torch
-        hf_id = {"bge-m3": "BAAI/bge-m3", "e5-large-v2": "intfloat/e5-large-v2"}[model_name]
-        # SentenceTransformer handles local caching automatically
-        model = SentenceTransformer(hf_id, cache_folder=str(model_dir))
-        model.gradient_checkpointing_enable() #memory optimization, slightly reduces speed
-        query_overhead = 0 #certain datasets need this
-        if(model_name == "e5-large-v2"):
-            query_overhead = len(model.tokenizer.encode("passage:", add_special_tokens=False))
-        if(CHUNKING_MODE == True):
-            text = text[:NUM_LINES]
-            #try ruis new method
-            text_lines = []
-            tokenizer = model.tokenizer
-            budget = context_n - query_overhead - 2 #tries to not account for special tokens
-            for line in text:
-                tokens = tokenizer.encode(line, add_special_tokens=False)
-                if(len(tokens) <= budget):
-                    text_lines.append(line)
-                else:
-                    for i in range(0, len(tokens), budget):
-                        chunk = tokens[i : i + budget]
-                        # 3. Decode back to text so ST can re-tokenize it with special tokens
-                        decoded_chunk = tokenizer.decode(chunk, skip_special_tokens=True)
-                        text_lines.append(decoded_chunk)
-                del tokens
-            #
-            if(model_name == "e5-large-v2"):
-                text_lines = ["passage:" + t for t in text_lines]
-            embedding = model.encode(text_lines, batch_size=1, convert_to_numpy=True)
-            if(len(embedding.shape) == 1):
-                embedding = embedding.reshape(1,embedding.shape[0])
-            return embedding
-        elif((CHUNKING_MODE == False) and (pooling_mode == 0)):
-            text = text[:NUM_LINES]
-            inputs = model.tokenize([text])
-            device = next(model.parameters()).device
-            inputs = {k: v.to(device) for k, v in inputs.items()}
-            with torch.no_grad():
-                output = model[0](inputs)
-                raw_matrix = output['token_embeddings']
-            return np.array(raw_matrix[0].to("cpu"))
-        elif((CHUNKING_MODE == False) and (pooling_mode == 1)): #mainly for e5
-            tokenizer = model.tokenizer
-            text = text[:NUM_LINES]
-            full_ids = []
-            for t in text:
-                full_text = t + "passage: " #e5 is sensitive to prefixes
-                full_ids.extend(tokenizer.encode(full_text, batch_size=1, add_special_tokens=False))
-            #create chunks of text strings
-            chunks = [full_ids[i : i + max_context] for i in range(0, len(full_ids), context_n)]
-            #convert IDs back to strings so .encode() can handle them
-            processed_chunks = [tokenizer.decode(c) for c in chunks if len(c) == context_n]
-            #now do the embedding
-            if(ACCELERATION_DEVICE == "xpu"):
-                torch.xpu.empty_cache()
-            elif(ACCELERATION_DEVICE == "cuda"):
-                torch.cuda.empty_cache()
-            embedding = model.encode(processed_chunks, convert_to_numpy=True)
-            #return result
-            return embedding
-        elif((CHUNKING_MODE == False) and (pooling_mode == 2)): #mainly for BAAI-BGE-M3
-            #1. use BGE-M3 tokenizer to wrap into 8190 token chunks
-            tokenizer = model.tokenizer
-            text = text[:NUM_LINES]
-            full_ids = []
-            for t in text:
-                full_ids.extend(tokenizer.encode(t, batch_size=1, add_special_tokens=False))
-            print(len(full_ids))
-            #create chunks of text strings
-            chunks = [full_ids[i : i + max_context] for i in range(0, len(full_ids), context_n)]
-            #convert IDs back to strings so .encode() can handle them
-            processed_chunks = [tokenizer.decode(c) for c in chunks if len(c) == context_n]
-            #now do the embedding
-            if(ACCELERATION_DEVICE == "xpu"):
-                torch.xpu.empty_cache()
-            elif(ACCELERATION_DEVICE == "cuda"):
-                torch.cuda.empty_cache()
-            embedding = model.encode(processed_chunks, batch_size=1, convert_to_numpy=True, normalize_embeddings=True)
-            #now return the results
-            return embedding
+                        # Rule: Partitioning for non-XPU
+                        tokens = engine.tokenize(line.encode('utf-8'), add_bos=False)
+                
+                        if(len(tokens) > context_n):
+                            for i in range(0, len(tokens), context_n):
+                                engine.reset() # Rule: Independence
+                                chunk_str = engine.detokenize(tokens[i : i + context_n]).decode('utf-8', errors='replace')
+                        
+                                # Use create_embedding for standard backends
+                                res = engine.create_embedding(chunk_str)
+                                vec = np.array(res['data'][0]['embedding'], dtype=data_type)
+                                full_text.append(vec)
+                        else:
+                            # Rule: Even for short lines, reset to ensure no cross-row leakage
+                            engine.reset()
+                            res = engine.create_embedding(line)
+                            vec = np.array(res['data'][0]['embedding'], dtype=data_type)
+                            full_text.append(vec)
 
-    #note: these others below are not going to be used
-    # API MODELS
-    elif model_name == "openai-3-large":
-        from openai import OpenAI
-        client = OpenAI()
-        return np.array(client.embeddings.create(input=text, model="text-embedding-3-large").data[0].embedding)
-    
-    # 4. GOOGLE GEMINI (API-based)
-    elif model_name == "gemini-2":
-        import google.generativeai as genai
-        Google_api_key = str(input("Enter your Google API Key: "))
-        # Requires GOOGLE_API_KEY env variable
-        genai.configure(api_key=os.environ[Google_api_key])
-        # 'models/text-embedding-004' or the new 'gemini-embedding-2-preview'
-        result = genai.embed_content(
-            model="models/gemini-embedding-2-preview",
-            content=text,
-            task_type="retrieval_document"
-        )
-        return np.array(result['embedding'])
-
-    # 5. NVIDIA NV-EMBED (Local via Transformers or NIM API)
-    elif model_name == "nv-embed-v2":
-        # Strategy A: Using NVIDIA's API (NIM)
-        nvidia_api_key = str(input("Enter your Nvidia API Key: "))
-        from openai import OpenAI # NVIDIA NIM uses OpenAI-compatible headers
-        client = OpenAI(
-            base_url="https://integrate.api.nvidia.com/v1",
-            api_key=os.environ[nvidia_api_key]
-        )
-        response = client.embeddings.create(
-            input=[text],
-            model="nvidia/nv-embed-v2"
-        )
-        return np.array(response.data[0].embedding)
-
-    # 6. NVIDIA NEMOTRON (Local via Sentence-Transformers)
-    elif model_name == "nemotron-embed":
-        from sentence_transformers import SentenceTransformer
-        # These are often hosted on HF as 'nvidia/llama-nemotron-embed-1b-v2'
-        model = SentenceTransformer("nvidia/llama-nemotron-embed-1b-v2", cache_folder=str(model_dir))
-        return model.encode(text)
-    pass
-    '''
-
-def extract_vectors(file_path, vector_column_name='embeddings'):
-    import os
-    import numpy as np
-    import pandas as pd
-    import json
-    import zstandard as zstd
-    import ml_dtypes
-    import pyarrow.feather as feather
-    """
-    Extracts vector data from various file formats and returns a NumPy array.
-    """
-    ext = os.path.splitext(file_path)[-1].lower()
-    print(f"--- Processing {ext} file ---")
-
-    try:
-        # 1. NumPy Files (Pure numerical data)
-        if ext == '.npy':
-            return np.load(file_path)
-        
-        # 2. Parquet Files (Common for Large Datasets)
-        elif ext == '.parquet':
-            df = pd.read_parquet(file_path)
-            print(".parquet KEYS: ")
-            print(df.keys())
-            col = _find_vector_column(df.iloc[0])
-            print(f"Autodetected vector column: '{col}'")
-            return np.stack(df[col].values)
-
-        # 3. JSON Lines (Common for API exports like OpenAI)
-        elif ext == '.jsonl':
-            vectors = []
-            with open(file_path, 'r') as f:
-                for line in f:
-                    data = json.loads(line)
-                    # Adjust 'embedding' key based on your specific JSON structure
-                    print("JSONL KEYS: ")
-                    print(data.keys())
-                    vectors.append(data[vector_column_name])
-            return np.array(vectors)
-        elif(file_path.endswith('.jsonl.zst')):
-            vectors = []
-            dctx = zstd.ZstdDecompressor()
-            with open(file_path, 'rb') as fh:
-                # Create a stream reader to decompress on the fly
-                with dctx.stream_reader(fh) as reader:
-                    # Wrap the binary stream in a text-mode wrapper
-                    import io
-                    text_stream = io.TextIOWrapper(reader, encoding='utf-8')
-                    for line in text_stream:
-                        if line.strip():
-                            data = json.loads(line)
-                            print("JSONL.ZST KEYS: ")
-                            print(data.keys())
-                            col = _find_vector_column(data)
-                            print(f"Autodetected vector column: '{col}'")
-                            vectors.append(data[col])
-            return np.array(vectors)
-        elif(file_path.endswith('.jsonl.offsets')):
-            jsonl_path = file_path.replace('.offsets', '')
-            # Read offsets (usually stored as 8-byte integers)
-            offsets = np.fromfile(file_path, dtype=np.int64)
-        
-            # Example: Extracting the first NUM_ROWS vectors using offsets
-            vectors = []
-            with open(jsonl_path, 'r') as f:
-                for off in offsets[:NUM_ROWS]:
-                    f.seek(off)
-                    line = f.readline()
-                    print("JSONL.OFFSETS KEYS: ")
-                    print(json.loads(line).keys())
-                    vectors.append(json.loads(line)[vector_column_name])
-            return np.array(vectors)
-
-        # 4. CSV Files (Text-heavy/Debug formats)
-        elif ext == '.csv': #don't use this either
-            df = pd.read_csv(file_path)
-            # CSV vectors are often stored as strings like "[0.1, 0.2...]"
-            # This converts those strings back into actual lists/arrays
-            print([df.iloc[i] for i in range(8)])
-            key = _find_vector_column(df.iloc[0])
-            #print("CSV KEYS: ")
-            #print(df.keys())
-            if isinstance(df[key].iloc[0], str):
-                df[key] = df[key].apply(json.loads)
-            return np.stack(df[key].values)
-
-        # 5. SafeTensors (Modern Model Weights)
-        elif ext == '.safetensors': #don't use this at all. It is more for model weights than vector embeddings
-            from safetensors.numpy import load_file
-            tensors = load_file(file_path)
-            # Safetensors usually have multiple keys; we return the first one or a specific one
-            #key = list(tensors.keys())[0]
-            print(tensors)
-            key = _find_vector_column(tensors)
-            print(f"Extracted key: {key}")
-            return tensors[key]
-
-        # 6. HDF5 (Scientific Data)
-        elif ext in ['.h5', '.hdf5']:
-            import h5py
-            with h5py.File(file_path, 'r') as f:
-                # Assuming vectors are in a dataset named 'vectors'
-                key = 'vectors' if 'vectors' in f else list(f.keys())[0]
-                return np.array(f[key])
-        
-        # 7. .txt (Create the vector embedding yourself)
-        elif ext == '.txt':
-            return embedding_model_selection(file_path, "", ".txt")
-            '''
-            text = open(file_path, 'r', encoding='utf-8').read()
-            #print(text)
-            framedata = [[4096, 40960, "Alibaba Group", "Quite advanced"],[3072, 8192, "OpenAI", "Used in ChatGPT"],[4096, 32768, "Microsoft", "Used in Bing Search, and Even Copilot and RAG applications"],[1024, 512, "Microsoft", "Warning: pretty low token range"],[1024, 8192, "Beijing Academy of Artificial Intelligence", ""],[768,8192, "Nomic AI", "new, and focused on performance"],[4096,32768, "Nvidia", "Based on E5 Mistral 7B, optimized for performance and accuracy. Typically used in research rather than industry."],[2048,8192, "Nvidia", "Custom Nemotron architecture, good for efficiency"],[3072,8192, "Google", "Used in Google Gemini Models."]]
-            df = pd.DataFrame(np.array(framedata))
-            df.columns = ['Maximum Dims:','Maximum # Tokens:', 'Source:', 'Notes:']
-            df.index = ['0.) Qwen3 Embedding 8B FP16: ', '1.) OpenAI V3 Large: ', '2.) E5 Mistral 7B FP16: ', '3.) E5 Large V2: ', '4.) BAAI BGE-M3: ', '5.) Nomic Embed V1.5 FP32: ', '6.) NV-Embed V2: ', '7.) Llama Nemotron Embedding 1B: ', '8.) Gemini Embedding 2'] #rows
-            pd.set_option('display.max_columns', None)
-            pd.set_option('display.width', 150)
-            print(df)
-            print("NOTE: These embedding models won't work properly, due to either being paid, requiring API keys, or not running locally:")
-            print("1.) OpenAI V3 Large\n6.) NV-Embed V2\n7.) Llama Nemotron Embedding 1B\n8.) Gemini Embedding 2\n")
-            choice = int(input("Enter your number choice here: "))
-            
-            options = ["qwen3","openai-3-large","e5-mistral","e5-large-v2","bge-m3","nomic","nv-embed-v2","nemotron-embed","gemini-2"]
-            return generate_local_embeddings(text, options[choice])
-            '''
-        
-        # 8. .arrow or .feather; extremelly rare, but huggingface datasets sometimes use this
-        elif ext == '.arrow' or ext == '.feather':
-            df = feather.read_feather(file_path)
-            key = _find_vector_column(df.iloc[0])
-            return np.stack(df[key].values)
-
-        else:
-            print(f"Unsupported extension: {ext}")
-            return None
-
-    except Exception as e:
-        print(f"Error extracting from {ext}: {e}")
-        return None
+                    return np.vstack(full_text).astype(data_type)
+                elif(CHUNKING_MODE == False): #still need to adjust this one
+                    response = engine.create_embedding(total_text)
+                    vectors = [row['embedding'] for row in response['data']]
+                    return np.array(vectors, dtype=data_type)
+        elif(pooling_mode == 0):
+            text = ''.join(text[:NUM_ROWS])
+        return np.array(engine.create_embedding(text)['data'][0]['embedding'])
 
 def embedding_model_selection(file_path, Text, mode):
     import os
@@ -731,6 +281,7 @@ def embedding_model_selection(file_path, Text, mode):
     context_mapping = {"qwen3": 40960, "e5-mistral": 32768, "e5-large-v2": 512, "bge-m3": 8192, "nomic": 8192, "gemma-2": 8192, "snowflake-arctic-embed-v2.0": 8192}
     native_context_mapping = {"qwen3": 32768, "e5-mistral": 4096, "e5-large-v2": 512, "bge-m3": 8192, "nomic": 2048, "gemma-2": 8192, "snowflake-arctic-embed-v2.0": 8192}
     datatype_mapping = {"qwen3": np.float16, "e5-mistral": np.float16, "e5-large-v2": np.float32, "bge-m3": np.float16, "nomic": np.float32, "gemma-2": np.float16, "snowflake-arctic-embed-v2.0": np.float32}
+    prefix_mapping = {"qwen3": 'None', "e5-mistral": 'query:', "e5-large-v2": 'query:', "bge-m3": 'None', "nomic": 'search_query:', "gemma-2": 'Retrieval-query:', "snowflake-arctic-embed-v2.0": 'None'}
     #print(text)
     framedata = [[4096, 40960, 32768, "CLS", "Alibaba Group", "Quite advanced"],[4096, 32768, 4096, "CLS", "Microsoft", "Used in Bing Search, and Even Copilot and RAG applications"],[1024, 512, 512, "Mean", "Microsoft", "Warning: pretty low token range"],[1024, 8192, 8192, "CLS", "Beijing Academy of Artificial Intelligence", ""],[768, 8192, 2048, "Mean", "Nomic AI", "new, and focused on performance"], [3584, 8192, 8192, "Mean(Adaptive)", "Google", "Open Source version of Google Gemini Embedding model"], [1024, 8192, 8192, "CLS", "Snowflake", "Commonly used for large-scale RAG in industry"]]
     df = pd.DataFrame(np.array(framedata))
@@ -744,23 +295,9 @@ def embedding_model_selection(file_path, Text, mode):
     options = ["qwen3","e5-mistral","e5-large-v2","bge-m3","nomic","gemma-2","snowflake-arctic-embed-v2.0"]
     print("before generating local embeddings")
     
-    #text formatting by pooling type
-    '''
-    pool_map = pool_mapping[options[choice]]
-    if(pool_map == 0): #by token
-        pass
-    elif(pool_map == 1): #average by row
-        pass
-    elif(pool_map == 2): #CLS / last token
-        pass
-    '''
-    BERT = False
-    BERT_LIST = ['nomic']
-    if(options[choice] in BERT_LIST):
-        BERT = True
-    return generate_local_embeddings(text, options[choice], pool_mapping[options[choice]], dim_mapping[options[choice]], context_mapping[options[choice]], native_context_mapping[options[choice]], BERT, datatype_mapping[options[choice]])
+    return generate_local_embeddings(text, options[choice], pool_mapping[options[choice]], dim_mapping[options[choice]], context_mapping[options[choice]], native_context_mapping[options[choice]], datatype_mapping[options[choice]], prefix_mapping[options[choice]])
 
-def dataset_embedding(file_path):
+def dataset_embedding(file_path, precomputed):
     import os
     import numpy as np
     import pandas as pd
@@ -781,16 +318,24 @@ def dataset_embedding(file_path):
         
         # 2. Parquet Files (Common for Large Datasets)
         elif ext == '.parquet':
-            df = pd.read_parquet(file_path)
-            print(".parquet KEYS --> Values: ")
-            i = 0
-            for k in df.keys():
-                print(str(i) + ".) " + str(k) + " --> " + str(df[k].values))
-                i += 1
-            selec = int(input("Select the column to choose by number: "))
-            text = df[df.keys()[selec]].values
-            print("Before selecting embedding model")
-            return embedding_model_selection(file_path, text, "dataset")
+            if(precomputed == False):
+                df = pd.read_parquet(file_path)
+                print(".parquet KEYS --> Values: ")
+                i = 0
+                for k in df.keys():
+                    print(str(i) + ".) " + str(k) + " --> " + str(df[k].values))
+                    i += 1
+                selec = int(input("Select the column to choose by number: "))
+                text = df[df.keys()[selec]].values
+                print("Before selecting embedding model")
+                return embedding_model_selection(file_path, text, "dataset")
+            elif(precomputed == True):
+                df = pd.read_parquet(file_path)
+                print(".parquet KEYS: ")
+                print(df.keys())
+                col = _find_vector_column(df.iloc[0])
+                print(f"Autodetected vector column: '{col}'")
+                return np.stack(df[col].values)
 
         # 3. JSON Lines (Common for API exports like OpenAI)
         elif ext == '.jsonl':
@@ -838,17 +383,29 @@ def dataset_embedding(file_path):
             return np.array(vectors)
 
         # 4. CSV Files (Text-heavy/Debug formats)
-        elif ext == '.csv': #don't use this either
-            df = pd.read_csv(file_path)
-            # CSV vectors are often stored as strings like "[0.1, 0.2...]"
-            # This converts those strings back into actual lists/arrays
-            print([df.iloc[i] for i in range(8)])
-            key = _find_vector_column(df.iloc[0])
-            #print("CSV KEYS: ")
-            #print(df.keys())
-            if isinstance(df[key].iloc[0], str):
-                df[key] = df[key].apply(json.loads)
-            return np.stack(df[key].values)
+        elif ext == '.csv':
+            if(precomputed == False):
+                df = pd.read_csv(file_path)
+                print(".csv KEYS --> Values: ")
+                i = 0
+                for k in df.keys():
+                    print(str(i) + ".) " + str(k) + " --> " + str(df[k].values))
+                    i += 1
+                selec = int(input("Select the column to choose by number: "))
+                text = df[df.keys()[selec]].values
+                print("Before selecting embedding model")
+                return embedding_model_selection(file_path, text, "dataset")
+            elif(precomputed == True):
+                df = pd.read_csv(file_path)
+                # CSV vectors are often stored as strings like "[0.1, 0.2...]"
+                # This converts those strings back into actual lists/arrays
+                print([df.iloc[i] for i in range(8)])
+                key = _find_vector_column(df.iloc[0])
+                #print("CSV KEYS: ")
+                #print(df.keys())
+                if isinstance(df[key].iloc[0], str):
+                    df[key] = df[key].apply(json.loads)
+                return np.stack(df[key].values)
 
         # 5. SafeTensors (Modern Model Weights)
         elif ext == '.safetensors': #don't use this at all. It is more for model weights than vector embeddings
@@ -872,23 +429,6 @@ def dataset_embedding(file_path):
         # 7. .txt (Create the vector embedding yourself)
         elif ext == '.txt':
             return embedding_model_selection(file_path, "", ".txt")
-            '''
-            text = open(file_path, 'r', encoding='utf-8').read()
-            #print(text)
-            framedata = [[4096, 40960, "Alibaba Group", "Quite advanced"],[3072, 8192, "OpenAI", "Used in ChatGPT"],[4096, 32768, "Microsoft", "Used in Bing Search, and Even Copilot and RAG applications"],[1024, 512, "Microsoft", "Warning: pretty low token range"],[1024, 8192, "Beijing Academy of Artificial Intelligence", ""],[768,8192, "Nomic AI", "new, and focused on performance"],[4096,32768, "Nvidia", "Based on E5 Mistral 7B, optimized for performance and accuracy. Typically used in research rather than industry."],[2048,8192, "Nvidia", "Custom Nemotron architecture, good for efficiency"],[3072,8192, "Google", "Used in Google Gemini Models."]]
-            df = pd.DataFrame(np.array(framedata))
-            df.columns = ['Maximum Dims:','Maximum # Tokens:', 'Source:', 'Notes:']
-            df.index = ['0.) Qwen3 Embedding 8B FP16: ', '1.) OpenAI V3 Large: ', '2.) E5 Mistral 7B FP16: ', '3.) E5 Large V2: ', '4.) BAAI BGE-M3: ', '5.) Nomic Embed V1.5 FP32: ', '6.) NV-Embed V2: ', '7.) Llama Nemotron Embedding 1B: ', '8.) Gemini Embedding 2'] #rows
-            pd.set_option('display.max_columns', None)
-            pd.set_option('display.width', 150)
-            print(df)
-            print("NOTE: These embedding models won't work properly, due to either being paid, requiring API keys, or not running locally:")
-            print("1.) OpenAI V3 Large\n6.) NV-Embed V2\n7.) Llama Nemotron Embedding 1B\n8.) Gemini Embedding 2\n")
-            choice = int(input("Enter your number choice here: "))
-            
-            options = ["qwen3","openai-3-large","e5-mistral","e5-large-v2","bge-m3","nomic","nv-embed-v2","nemotron-embed","gemini-2"]
-            return generate_local_embeddings(text, options[choice])
-            '''
         
         # 8. .arrow or .feather; extremelly rare, but huggingface datasets sometimes use this
         elif ext == '.arrow' or ext == '.feather':
@@ -1554,9 +1094,9 @@ def run_simulation():
     #print(file_path)
     computation_choice = str(input("Is this data precomputed?[Y/N]: ")).lower()
     if(computation_choice == "y"):
-        result = extract_vectors(file_path)
+        result = dataset_embedding(file_path, True)
     elif(computation_choice == "n"):
-        result = dataset_embedding(file_path)
+        result = dataset_embedding(file_path, False)
     if(PRINT_ORIGINAL == True):
         print("\nORIGINAL VECTOR EMBEDDING DATA: " + str(result.shape))
         print(result)
