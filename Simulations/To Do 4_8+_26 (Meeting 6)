@@ -1,10 +1,15 @@
-To do 4_3+_26: (B0.9.0 - Beta)(FinalSimulation.py)
-- Add an option to only do compression analytics on the first few MSBs (controllable with settings)(brings it closer to TRACE)
-- Test on more datasets
-- Fix the embedding model truncation and padding characteristics, follow Rui’s rules
+To do 4_8+_26: (B0.9.4 - Beta)(FinalSimulation.py)
+- Most important: Test data truncation and wrapping rules for non-xpu machines
 - Extensively test Gemma 2 and Snowflake
+
+Outside of Simulation Development:
+- test simulation on workstation
+- Test on more datasets
 - Import the data into this documentation
 - Download the rest of the datasets
+
+Potential Experimental:
+- Add an option to only do compression analytics on the first few MSBs (controllable with settings)(brings it closer to TRACE)
 - Maybe add the precursor prompting to (Nomic Embed (optional, search_query), E5 large v2 (query:), E5 Mistral (query:), Gemma 2 (Retrieval-query:))
 - (maybe?) add some more metrics: (brings it closer to TRACE)
 	- bandwidth savings
