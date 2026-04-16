@@ -1,12 +1,11 @@
-To do 4_8+_26: (B0.9.4 - Beta)(FinalSimulation.py)
+To do 4_17+_26: (B0.9.6 - Beta)(FinalSimulation.py)
 - Most important: Test data truncation and wrapping rules for non-xpu machines
-- Extensively test Gemma 2 and Snowflake
+- Documentation: add new raw metric to your documentation tables
 
-Outside of Simulation Development:
-- test simulation on workstation
-- Test on more datasets
-- Import the data into this documentation
-- Download the rest of the datasets
+Future roadmap: (R1.0.0)
+- Add multimodal embedding models
+- Add multimodel support: png, jpg, mp3, mp4
+- Extensively test AMD ROCm and Nvidia CUDA compatibility
 
 Potential Experimental:
 - Add an option to only do compression analytics on the first few MSBs (controllable with settings)(brings it closer to TRACE)
