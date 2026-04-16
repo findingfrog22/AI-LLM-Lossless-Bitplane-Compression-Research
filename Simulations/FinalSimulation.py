@@ -6,7 +6,7 @@ import os
 base_directory = os.path.dirname(os.path.abspath(__file__))
 import torch
 file_path = "" #don't touch this unless you know what you are doing
-NUM_ROWS = 100 #This is for you to choose, it is the number of vector embeddings (essentially # of tokens)[must be a multiple of 8]
+NUM_ROWS = 1024 #This is for you to choose, it is the number of vector embeddings (essentially # of tokens)[must be a multiple of 8]
 #Note: your NUM_ROWS should ideally exceed your BLOCK_SIZE, and for best results, should be a multiple of BLOCK_SIZE
 NUM_DIMS = 768 #768 is default, but will automatically change with shape recognition
 MAX_ROWS = 10000 #10k is default, but will automatically change with shape recognition
@@ -41,7 +41,7 @@ TOKEN_CONTEXT = -1
 # - other
 # - -1 [default, uses model default, native setting]
 
-NUM_LINES = 100
+NUM_LINES = 1024
 #this is the number of lines of text that the embedding model reads to convert to embeddings
 #make sure that it gives enough text for the embedding model to use, or else it might crash the program or
 # give unpredictable results
@@ -138,6 +138,7 @@ def generate_local_embeddings(text, model_name, pooling_mode, dim_count, max_con
     import zstandard as zstd
     from pathlib import Path
     import sentence_transformers
+    from ml_dtypes import bfloat16
     """Checks local 'models' folder, downloads if missing, and runs inference."""
     script_dir = Path(__file__).parent.resolve()
     model_dir = script_dir / "models"
@@ -166,20 +167,23 @@ def generate_local_embeddings(text, model_name, pooling_mode, dim_count, max_con
         context_n = min(TOKEN_CONTEXT, max_context)
 
     # GGUF MODELS (Llama-cpp-python) #removed nomic from GGUF models, as it causes compatibility issues with certain backends, like vulkan
-    if model_name in ["qwen3", "e5-mistral", "nomic", "bge-m3", "e5-large-v2", "gemma-2", "snowflake-arctic-embed-v2.0"]:
+    if model_name in ["qwen3", "e5-mistral", "nomic", "bge-m3", "e5-large-v2", "gemma-3", "snowflake-arctic-embed-v2.0", "harrier-oss-v1-0.6b"]:
         from llama_cpp import Llama
         from huggingface_hub import hf_hub_download
         import llama_cpp
         
         configs = {
-            "qwen3": ("Qwen/Qwen3-Embedding-8B-GGUF", "Qwen3-Embedding-8B-f16.gguf"),
+            "qwen3": ("Qwen/Qwen3-Embedding-4B-GGUF", "Qwen3-Embedding-4B-f16.gguf"),
             "e5-mistral": ("dranger003/e5-mistral-7b-instruct-GGUF", "ggml-e5-mistral-7b-instruct-f16.gguf"),
             "nomic": ("nomic-ai/nomic-embed-text-v1.5-GGUF", "nomic-embed-text-v1.5.f32.gguf"),
             "e5-large-v2": ("ChristianAzinn/e5-large-v2-gguf", "e5-large-v2_fp32.gguf"),
             "bge-m3": ("gpustack/bge-m3-GGUF", "bge-m3-FP16.gguf"),
-            "gemma-2": ("alamios/gemma-2-9b-it-GGUF-f16", "gemma-2-9b-it.f16.gguf"),
-            "snowflake-arctic-embed-v2.0": ("Casual-Autopsy/snowflake-arctic-embed-l-v2.0-gguf", "snowflake-arctic-embed-l-v2.0-f32.gguf")
+            "gemma-3": ("second-state/embeddinggemma-300m-GGUF", "embeddinggemma-300m-f16.gguf"),
+            "snowflake-arctic-embed-v2.0": ("Casual-Autopsy/snowflake-arctic-embed-l-v2.0-gguf", "snowflake-arctic-embed-l-v2.0-f32.gguf"),
+            "harrier-oss-v1-0.6b": ("SuperPauly/harrier-oss-v1-0.6b-gguf", "harrier-oss-v1-0.6B-BF16.gguf")
         }
+        #original qwen3 8B: ("Qwen/Qwen3-Embedding-8B-GGUF", "Qwen3-Embedding-8B-f16.gguf")
+        #original gemma 2 embed 9B: ("alamios/gemma-2-9b-it-GGUF-f16", "gemma-2-9b-it.f16.gguf")
         #original e5-mistral: ("intfloat/e5-mistral-7b-instruct", "e5-mistral-7b-instruct-f16.gguf")
         repo, filename = configs[model_name]
         m_path = hf_hub_download(repo_id=repo, filename=filename, local_dir=str(model_dir))
@@ -187,7 +191,8 @@ def generate_local_embeddings(text, model_name, pooling_mode, dim_count, max_con
         #setting up engine parameters
         if(ACCELERATION_DEVICE == "xpu"): #xpu sycl backend has some bugs/quirks that require attention
             if(model_name == "e5-large-v2"):
-                engine = Llama(model_path=m_path, embedding=True, flash_attn=False, logits_all=True, pooling_type=pooling_mode, n_parallel=1, n_gpu_layers=0, n_threads=14, main_gpu=-1, offload_kqv=False, use_mmap=True, n_ctx=context_n, n_batch=BATCH_SIZE, n_ubatch=BATCH_SIZE, verbose=True)
+                engine = Llama(model_path=m_path, embedding=True, flash_attn=False, logits_all=False, pooling_type=pooling_mode, n_parallel=1, n_gpu_layers=0, n_threads=14, main_gpu=-1, offload_kqv=False, use_mmap=False, n_ctx=context_n, n_batch=1, n_ubatch=1, verbose=False)
+                #engine = Llama(model_path=m_path, embedding=True, flash_attn=False, pooling_type=pooling_mode, n_parallel=1, n_gpu_layers=0, n_threads=14, main_gpu=-1, n_ctx=context_n, n_batch=1, verbose=False)
             else:
                 engine = Llama(model_path=m_path, embedding=True, flash_attn=False, logits_all=True, pooling_type=pooling_mode, n_parallel=1, n_gpu_layers=-1, use_mmap=True, n_ctx=context_n, n_batch=BATCH_SIZE, n_ubatch=BATCH_SIZE, verbose=False)
         else:
@@ -206,6 +211,7 @@ def generate_local_embeddings(text, model_name, pooling_mode, dim_count, max_con
             #done, rui's method now works for xpu chunking mode = true
             #TO DO for 4/8+: add ruis chunking mode for non-xpu devices, then add your wrapping chunking mode for both xpu and non-xpu
             full_text = []
+            c = 0
             if(ACCELERATION_DEVICE == "xpu"): #xpu sycl library has a quirk where it can only embed 1 string line at a time
                 if(CHUNKING_MODE == True): #does the sentence wrapping only when too long
                     for line in total_text:
@@ -213,18 +219,25 @@ def generate_local_embeddings(text, model_name, pooling_mode, dim_count, max_con
                             line = prefix + line
                         tokens = engine.tokenize(line.encode('utf-8'), add_bos=False)
                         if(len(tokens) > context_n):
+                            #print(len(tokens))
                             for i in range(0, len(tokens), context_n):
                                 engine.reset()
                                 res = np.array(engine.embed(engine.detokenize(tokens[i : i + context_n]).decode('utf-8', errors='replace')), dtype=data_type)
                                 if(res.ndim > 1):
                                     res = res.ravel()
+                                #print(res)
                                 full_text.append(res)
+                                c += 1
                         else:
                             engine.reset()
                             res = np.array(engine.embed(line), dtype=data_type)
                             if(res.ndim > 1):
                                 res = res.ravel()
                             full_text.append(res)
+                            c += 1
+                        #print("Progress: " + str(c))
+                        if(c >= NUM_ROWS):
+                            break
                     return np.vstack(full_text, dtype=data_type)
                 elif(CHUNKING_MODE == False): #still need to adjust this one
                     text = ''.join(text[:NUM_LINES])
@@ -270,29 +283,30 @@ def embedding_model_selection(file_path, Text, mode):
     import os
     import numpy as np
     import pandas as pd
+    from ml_dtypes import bfloat16
     
     if(mode == ".txt"):
         text = open(file_path, 'r', encoding='utf-8').read()
     elif(mode == "dataset"):
         text = Text
     
-    pool_mapping = {"qwen3": 2, "openai-3-large": 1, "e5-mistral": 2, "e5-large-v2": 1, "bge-m3": 2, "nomic": 1, "nv-embed-v2": 0, "nemotron-embed": 0, "gemini-2": 1, "gemma-2": 1, "snowflake-arctic-embed-v2.0": 2}
-    dim_mapping = {"qwen3": 4096, "openai-3-large": 3072, "e5-mistral": 4096, "e5-large-v2": 1024, "bge-m3": 1024, "nomic": 768, "nv-embed-v2": 4096, "nemotron-embed": 2048, "gemini-2": 3072, "gemma-2": 3584, "snowflake-arctic-embed-v2.0": 1024}
-    context_mapping = {"qwen3": 40960, "e5-mistral": 32768, "e5-large-v2": 512, "bge-m3": 8192, "nomic": 8192, "gemma-2": 8192, "snowflake-arctic-embed-v2.0": 8192}
-    native_context_mapping = {"qwen3": 32768, "e5-mistral": 4096, "e5-large-v2": 512, "bge-m3": 8192, "nomic": 2048, "gemma-2": 8192, "snowflake-arctic-embed-v2.0": 8192}
-    datatype_mapping = {"qwen3": np.float16, "e5-mistral": np.float16, "e5-large-v2": np.float32, "bge-m3": np.float16, "nomic": np.float32, "gemma-2": np.float16, "snowflake-arctic-embed-v2.0": np.float32}
-    prefix_mapping = {"qwen3": 'None', "e5-mistral": 'query:', "e5-large-v2": 'query:', "bge-m3": 'None', "nomic": 'search_query:', "gemma-2": 'Retrieval-query:', "snowflake-arctic-embed-v2.0": 'None'}
+    pool_mapping = {"qwen3": 2, "e5-mistral": 2, "e5-large-v2": 1, "bge-m3": 2, "nomic": 1, "gemma-3": 1, "snowflake-arctic-embed-v2.0": 2, "harrier-oss-v1-0.6b": 2}
+    dim_mapping = {"qwen3": 2560, "e5-mistral": 4096, "e5-large-v2": 1024, "bge-m3": 1024, "nomic": 768, "gemma-3": 768, "snowflake-arctic-embed-v2.0": 1024, "harrier-oss-v1-0.6b": 1024}
+    context_mapping = {"qwen3": 32768, "e5-mistral": 32768, "e5-large-v2": 512, "bge-m3": 8192, "nomic": 8192, "gemma-3": 2048, "snowflake-arctic-embed-v2.0": 8192, "harrier-oss-v1-0.6b": 32768}
+    native_context_mapping = {"qwen3": 32768, "e5-mistral": 4096, "e5-large-v2": 512, "bge-m3": 8192, "nomic": 2048, "gemma-3": 2048, "snowflake-arctic-embed-v2.0": 8192, "harrier-oss-v1-0.6b": 32768}
+    datatype_mapping = {"qwen3": np.float16, "e5-mistral": np.float16, "e5-large-v2": np.float32, "bge-m3": np.float16, "nomic": np.float32, "gemma-3": np.float16, "snowflake-arctic-embed-v2.0": np.float32, "harrier-oss-v1-0.6b": bfloat16}
+    prefix_mapping = {"qwen3": 'None', "e5-mistral": 'query:', "e5-large-v2": 'query:', "bge-m3": 'None', "nomic": 'search_query:', "gemma-3": 'Retrieval-query:', "snowflake-arctic-embed-v2.0": 'None', "harrier-oss-v1-0.6b": 'None'}
     #print(text)
-    framedata = [[4096, 40960, 32768, "CLS", "Alibaba Group", "Quite advanced"],[4096, 32768, 4096, "CLS", "Microsoft", "Used in Bing Search, and Even Copilot and RAG applications"],[1024, 512, 512, "Mean", "Microsoft", "Warning: pretty low token range"],[1024, 8192, 8192, "CLS", "Beijing Academy of Artificial Intelligence", ""],[768, 8192, 2048, "Mean", "Nomic AI", "new, and focused on performance"], [3584, 8192, 8192, "Mean(Adaptive)", "Google", "Open Source version of Google Gemini Embedding model"], [1024, 8192, 8192, "CLS", "Snowflake", "Commonly used for large-scale RAG in industry"]]
+    framedata = [[2560, 32768, 32768, "CLS", "Alibaba Group", "Quite advanced"],[4096, 32768, 4096, "CLS", "Microsoft", "Used in Bing Search, and Even Copilot and RAG applications"],[1024, 512, 512, "Mean", "Microsoft", "Warning: pretty low token range"],[1024, 8192, 8192, "CLS", "Beijing Academy of Artificial Intelligence", ""],[768, 8192, 2048, "Mean", "Nomic AI", "new, and focused on performance"], [768, 2048, 2048, "Mean", "Google", "Based on Gemma 3, 308M parameters. Open Source version of Google Gemini Embedding model"], [1024, 8192, 8192, "CLS", "Snowflake", "Commonly used for large-scale RAG in industry"], [1024, 32768, 32768, "CLS", "Microsoft", "Bleeding edge for RAG applications, better than E5, released early 2026"]]
     df = pd.DataFrame(np.array(framedata))
     df.columns = ['Maximum Dims:','Maximum # Tokens:', 'Native Token Context:', 'Pooling Type:', 'Source:', 'Notes:']
-    df.index = ['0.) Qwen3 Embedding 8B (FP16): ', '1.) E5 Mistral 7B (FP16): ', '2.) E5 Large V2 (FP32): ', '3.) BAAI BGE-M3 (FP16): ', '4.) Nomic Embed V1.5 (FP32): ', '5.) Gemma 2 Embedding 9B (FP16):', '6.) Snowflake Arctic Embedding L V2.0 (FP32):'] #rows
+    df.index = ['0.) Qwen3 Embedding 4B (FP16): ', '1.) E5 Mistral 7B (FP16): ', '2.) E5 Large V2 (FP32): ', '3.) BAAI BGE-M3 (FP16): ', '4.) Nomic Embed V1.5 (FP32): ', '5.) EmbeddingGemma 300M (FP16):', '6.) Snowflake Arctic Embedding L V2.0 (FP32):', '7.) Harrier OSS V1 0.6B (BF16):'] #rows
     pd.set_option('display.max_columns', None)
     pd.set_option('display.width', 150)
     print(df)
     choice = int(input("Enter your number choice here: "))
             
-    options = ["qwen3","e5-mistral","e5-large-v2","bge-m3","nomic","gemma-2","snowflake-arctic-embed-v2.0"]
+    options = ["qwen3","e5-mistral","e5-large-v2","bge-m3","nomic","gemma-3","snowflake-arctic-embed-v2.0","harrier-oss-v1-0.6b"]
     print("before generating local embeddings")
     
     return generate_local_embeddings(text, options[choice], pool_mapping[options[choice]], dim_mapping[options[choice]], context_mapping[options[choice]], native_context_mapping[options[choice]], datatype_mapping[options[choice]], prefix_mapping[options[choice]])
@@ -449,6 +463,7 @@ def dataset_embedding(file_path, precomputed):
 #normalization
 def normalize(np_emb):
     import numpy
+    from ml_dtypes import bfloat16
     norm = numpy.linalg.norm(np_emb[0])
     if((norm >= 0.999) and (norm <= 1.001)):
         #is normalized, no need to normalize it, just return the already normalized embedding data
@@ -460,9 +475,9 @@ def normalize(np_emb):
         #verify
         verify = numpy.mean(numpy.linalg.norm(normalizedembeddings, axis=1))
         if((verify >= 0.999) and (verify <= 1.001)):
-            return normalizedembeddings
+            return normalizedembeddings.astype(np_emb.dtype) #make sure it is in same as basetype
         print("Not normalized. Normalization failed. The mean deviation is: " + str(verify))
-        return normalizedembeddings
+        return normalizedembeddings.astype(np_emb.dtype)
 
 #quantization functions
 def symmetric_scalar_quantization(tens_emb):
@@ -532,7 +547,13 @@ def Symmetric_Scalar_Error(orig, dequant):
 
 def direct_bitplane(tens_emb): #replaces the older version
     import torch
-    tens_bits = tens_emb.element_size() * 8
+    from ml_dtypes import bfloat16
+    import numpy
+    
+    if(BASE_TYPE == bfloat16): #account for bfloat16
+        tens_bits = 16
+    else: #for all the other standard types
+        tens_bits = tens_emb.element_size() * 8
     #print("TENS BITS___________: " + str(tens_bits))
     if(tens_bits == 32):
         view_type = torch.int32
@@ -616,11 +637,11 @@ def pack_bits(tensor_r): #NOTE: both of these modes are confirmed correct and wo
     #clear xpu memory: this is especially important for very large tensors that fill your VRAM
     if(ACCELERATION_DEVICE == "xpu"):
         torch.xpu.empty_cache()
+        stats = torch.xpu.memory_stats()
+        print(f"Allocated: {stats['allocated_bytes.all.current'] / 1024**3:.2f} GB")
+        print(f"Reserved: {stats['reserved_bytes.all.current'] / 1024**3:.2f} GB")
     elif(ACCELERATION_DEVICE == "cuda"):
         torch.cuda.empty_cache()
-    stats = torch.xpu.memory_stats()
-    print(f"Allocated: {stats['allocated_bytes.all.current'] / 1024**3:.2f} GB")
-    print(f"Reserved: {stats['reserved_bytes.all.current'] / 1024**3:.2f} GB")
     # 0. Make sure the input is a tensor, turn it to tensor if it is a numpy array
     if(torch.is_tensor(tensor_r) == False):
         tensor_s = torch.tensor(tensor_r)
@@ -833,58 +854,33 @@ def bitplane_compression_benchmark(tensor_d, title): #replaces run_phased_benchm
                 
             metrics[n]["Bit Plane Ratios (ZSTD):"] = z_ratios
             metrics[n]["Bit Plane Ratios (LZ4):"] = l_ratios
-        
-        '''
-        #packed_b (packs across w)
-        b_temporal = packed.permute(1,0,2).contiguous().cpu().numpy()
-        temporaltasks = list()
-        if(SHOW_NEGATIVE_COMPRESSION_RATIOS == False): #use this for the rewrite
-            for k in range(B_b):
-                bitplanetasks = [[b_temporal[k][x].tobytes()] for x in range(b_temporal.shape[1])]
-                z_tsizes = sum(pool.map(zstd_compress_list, bitplanetasks))
-                l_tsizes = sum(pool.map(lz4_compress_list, bitplanetasks))
-                th_z = round((z_tsizes/1024) / orig_size_kb, 3)
-                th_l = round((l_tsizes/1024) / orig_size_kb, 3)
-                results[k]["Spatial(ZSTD):"] = th_z if th_z < 1.0 else 1.000
-                results[k]["Spatial(LZ4):"] = th_l if th_l < 1.0 else 1.000
-                #add to return results too
-                #res["Spatial(ZSTD):"] += z_tsizes*8 if z_tsizes < (orig_size_kb*1024) else orig_size_kb*1024*8
-                #res["Spatial(LZ4):"] += l_tsizes*8 if l_tsizes < (orig_size_kb*1024) else orig_size_kb*1024*8
-        else:
-            for k in range(B_b):
-                bitplanetasks = [[b_temporal[k][x].tobytes()] for x in range(b_temporal.shape[1])]
-                z_tsizes = sum(pool.map(zstd_compress_list, bitplanetasks))
-                l_tsizes = sum(pool.map(lz4_compress_list, bitplanetasks))
-                results[k]["Spatial(ZSTD):"] = round((z_tsizes/1024) / orig_size_kb, 3)
-                results[k]["Spatial(LZ4):"] = round((l_tsizes/1024) / orig_size_kb, 3)
-                #add to the return results too
-                #res["Spatial(ZSTD):"] += z_tsizes*8
-                #res["Spatial(LZ4):"] += l_tsizes*8
-    '''
+    
     #now, print and return the results
     
     df0 = pd.DataFrame(list(metrics.values())).sort_values("Vector Embedding", ascending=False)
-    #df = pd.DataFrame(list(results.values())).sort_values("Bitplane", ascending=False)
-    #pd.set_option('display.max_columns', None)
-    #pd.set_option('display.width', 150)
-    #print(df)
     print(df0)
-    return ret #for further analytics
+    return ret #for further analytics ["Concatenated Bits (ZSTD):"] ["Concatenated Bits (LZ4):"]
 
 def space_saving_metrics(bit_comp_quant, scale_tens, raw_tens, quant_raw):
     import pandas as pd
     import numpy as np
     import torch
+    from ml_dtypes import bfloat16
     framedata = [[],[],[],[]]
     #preparing for calculations
     scalar_bits = scale_tens.shape[0]*scale_tens.shape[1]*scale_tens.shape[2] #note: scale_tens must be the bitplane one
     global BASE_TYPE
     bitsize = 0
-    BASE_TYPE = torch.as_tensor(np.array([], dtype=BASE_TYPE)).dtype
-    if(BASE_TYPE.is_floating_point):
-        bitsize += torch.finfo(BASE_TYPE).bits
-    else:
-        bitsize += torch.iinfo(BASE_TYPE).bits
+    if(BASE_TYPE != bfloat16): #should only be in use if BASE_TYPE is not bfloat16
+        BASE_TYPE = torch.as_tensor(np.array([], dtype=BASE_TYPE)).dtype
+        if(BASE_TYPE.is_floating_point):
+            bitsize += torch.finfo(BASE_TYPE).bits
+        else:
+            bitsize += torch.iinfo(BASE_TYPE).bits
+    
+    if(BASE_TYPE == bfloat16): #account for bfloat16
+        bitsize += 16
+    
     Raw_size = raw_tens.shape[0]*raw_tens.shape[1]*bitsize #note: raw_tens must be the initial tensor before any quantization or bitplaning
     print("DEBUG: DIRECT SIZE RIGHT BEFORE COMPRESSION: ")
     direct_size = direct_compression(raw_tens) #this is the size in bits of directly compressing raw_tens
@@ -919,18 +915,28 @@ def space_saving_metrics(bit_comp_quant, scale_tens, raw_tens, quant_raw):
     pd.set_option('display.width', 150)
     print(df)
     print("\n Extra: Uncompressed Bitplaned Quant+Scalar vs Uncompressed Bitplaned Original Tensor: " + str(round((1-((bit_comp_quant["Original Quantized Bits:"]+scalar_bits)/Raw_size))*100, 3)))
+    
+    #for extra analytics on raw compression
+    return [Raw_size, direct_size] #[1][0] is ZSTD, [1][1] is LZ4
 
 def direct_compression(tens):
     import zstandard as zstd
     import numpy as np
     import lz4.frame
     import torch
+    from ml_dtypes import bfloat16
     
     if(torch.is_tensor(tens) == False):
-        tens = torch.from_numpy(tens).to(ACCELERATION_DEVICE)
+        if(BASE_TYPE == bfloat16): #account for bfloat16 casting
+            tens = torch.from_numpy(tens.view(np.uint16)).view(torch.bfloat16).to(ACCELERATION_DEVICE)
+        else:
+            tens = torch.from_numpy(tens).to(ACCELERATION_DEVICE)
     
     #get the raw bytes
-    rawbytes = tens.cpu().numpy().tobytes()
+    if(BASE_TYPE == bfloat16): #account for bfloat16 casting
+        rawbytes = tens.detach().cpu().view(torch.uint16).numpy().view(bfloat16).tobytes()
+    else:
+        rawbytes = tens.cpu().numpy().tobytes()
     print("DIRECT BYTES: " + str(len(rawbytes)))
     
     #do zstd compression first
@@ -1016,7 +1022,12 @@ def quantization_histogram(quant, mode):
     
 def plot_embedding_histogram(tensor,filepath): #gets the histogram of the range of input data from vector embedding
     import matplotlib.pyplot as plt
-    flat_data = tensor.cpu().numpy().flatten()
+    from ml_dtypes import bfloat16
+    import torch
+    if(tensor.dtype == torch.bfloat16): #accounts for bfloat16 casting
+        flat_data = tensor.detach().cpu().view(torch.uint16).numpy().view(bfloat16).flatten()
+    else:
+        flat_data = tensor.cpu().numpy().flatten()
     plt.hist(flat_data, bins=100, color='blue', alpha=0.7)
     plt.title("Range of Vector Embedding Input Data: [path=" + str(filepath) + "]")
     plt.xlabel("Value")
@@ -1060,6 +1071,39 @@ def RLE_bitplane_compressibility(matrix, title):
     
     print("\nDEBUG: Overall Average RLE Compression Ratio: " + str(torch.mean(ratio)))
     return torch.mean(ratio)
+
+def raw_analytics(bitsizes, bitplane_bitsizes):
+    #bitsizes is passed from space_saving_metrics(), and bitplane_bitsizes is passed from bitplane_compression_benchmark() of raw
+    #bitsizes is of this format:
+    # [0] --> size of original raw tensor in bits
+    # [1][0] --> compressed size of raw tensor in bits (ZSTD)(no bitplane)
+    # [1][1] --> compressed size of raw tensor in bits (LZ4)(no bitplane)
+    #bitplane_bitsizes is of this format:
+    # ["Concatenated Bits (ZSTD):"] --> compressed size of raw tensor in bits (ZSTD)(bitplane)
+    # ["Concatenated Bits (LZ4):"] --> compressed size of raw tensor in bits (LZ4)(bitplane)
+    
+    #metrics to print:
+    # - % savings no bitplane compressed vs baseline (zstd and lz4)
+    # - % savings bitplane compressed vs baseline (zstd and lz4)
+    # - % savings bitplane vs no bitplane compressed (zstd and lz4)
+    
+    import pandas as pd
+    import numpy as np
+    framedata = [[],[],[]]
+    #do your thing here to add to dataframe
+    framedata[0].append(round((1-(bitsizes[1][0]/bitsizes[0]))*100, 3)) #zstd
+    framedata[0].append(round((1-(bitsizes[1][1]/bitsizes[0]))*100, 3)) #lz4
+    framedata[1].append(round((1-(bitplane_bitsizes["Concatenated Bits (ZSTD):"]/bitsizes[0]))*100, 3)) #zstd
+    framedata[1].append(round((1-(bitplane_bitsizes["Concatenated Bits (LZ4):"]/bitsizes[0]))*100, 3)) #lz4
+    framedata[2].append(round((1-(bitplane_bitsizes["Concatenated Bits (ZSTD):"]/bitsizes[1][0]))*100, 3)) #zstd
+    framedata[2].append(round((1-(bitplane_bitsizes["Concatenated Bits (LZ4):"]/bitsizes[1][1]))*100, 3)) #lz4
+    #end
+    df = pd.DataFrame(np.array(framedata))
+    df.columns = ['Raw % Savings (ZSTD):','Raw % Savings (LZ4):']
+    df.index = ['No Bitplane Compressed vs Original Data Size:', 'Bitplane Compressed vs Original Data Size:', 'Bitplane Compressed vs No Bitplane Compressed:'] #rows
+    pd.set_option('display.max_columns', None)
+    pd.set_option('display.width', 150)
+    print(df)
 
 #Main program logic
 
@@ -1110,6 +1154,7 @@ def run_simulation():
         print("NUM_DIMS: " + str(NUM_DIMS))
     import torch
     import numpy
+    from ml_dtypes import bfloat16
     global BASE_TYPE
     BASE_TYPE = result.dtype
     if(PRINT_ORIGINAL == True):
@@ -1118,18 +1163,27 @@ def run_simulation():
     global ACCELERATION_DEVICE
     res = result[:NUM_ROWS] #reduces it to your specified number of rows to analyze
     numpy_emb = numpy.stack(res)
-    tens_emb = torch.tensor(numpy_emb).to(ACCELERATION_DEVICE) #NOTE: we will keep this for later when we do unquantized comparisons to the quantized stuff
+    if(numpy_emb.dtype == bfloat16): #accounts for bfloat16 casting
+        tens_emb = torch.from_numpy(numpy_emb.view(numpy.uint16)).view(torch.bfloat16).to(ACCELERATION_DEVICE)
+    else:
+        tens_emb = torch.tensor(numpy_emb).to(ACCELERATION_DEVICE) #NOTE: we will keep this for later when we do unquantized comparisons to the quantized stuff
     #now the range of input from the file
     if(PRINT_ORIGINAL == True):
         print("\nFIGURE 1.0: Range of input tensor: " + str(file_path) + " [stored on a file called EmbeddingRange.png]")
-    raw_emb = torch.tensor(numpy_emb).to(ACCELERATION_DEVICE)
+    if(numpy_emb.dtype == bfloat16): #accounts for bfloat16 casting
+        raw_emb = torch.from_numpy(numpy_emb.view(numpy.uint16)).view(torch.bfloat16).to(ACCELERATION_DEVICE)
+    else:
+        raw_emb = torch.tensor(numpy_emb).to(ACCELERATION_DEVICE)
     plot_embedding_histogram(raw_emb,file_path)
     #now symmetric scalar quantization
     
     #stage 1: normalize vector embedding input
     print("\nSTAGE 0: Normalization: ")
     normalized_emb = normalize(numpy_emb)
-    normalized_tensor = torch.tensor(normalized_emb).to(ACCELERATION_DEVICE)
+    if(numpy_emb.dtype == bfloat16): #account for bfloat16 casting
+        normalized_tensor = torch.from_numpy(normalized_emb.view(numpy.uint16)).view(torch.bfloat16).to(ACCELERATION_DEVICE)
+    else:
+        normalized_tensor = torch.tensor(normalized_emb).to(ACCELERATION_DEVICE)
     print("Normalized Embedding Input: ")
     print(normalized_tensor)
     
@@ -1170,7 +1224,7 @@ def run_simulation():
     print("\nSTAGE 5+6: Bitpacking + LZ4 & ZSTD Compression: ")
     quant_comp_results = bitplane_compression_benchmark(quantized_bitplane, "bitplane quant horizontal")
     #now for some extra metrics:
-    space_saving_metrics(quant_comp_results, scalar_bitplane, normalized_tensor, quantized)
+    rw_res = space_saving_metrics(quant_comp_results, scalar_bitplane, normalized_tensor, quantized)
     #I want to test delta transformation too
     #it gives ~1% improvement, which is not good becuase it introduces computational complexity which hurts latency
     if(PRINT_DELTA_TRANSFORMATION == True):
@@ -1189,7 +1243,8 @@ def run_simulation():
     
     #raw
     if(IGNORE_RAW == False):
-        bitplane_compression_benchmark(raw_bitplane, "bitplane direct horizontal")
+        bit_res = bitplane_compression_benchmark(raw_bitplane, "bitplane direct horizontal")
+        raw_analytics(rw_res, bit_res)
         if(PRINT_DELTA_TRANSFORMATION == True):
             tensor_delta_raw = raw_bitplane.clone()
             tensor_delta_raw[:, 1:] = raw_bitplane[:, 1:] - raw_bitplane[:, :-1]
