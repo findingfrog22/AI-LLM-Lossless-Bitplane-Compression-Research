@@ -153,12 +153,13 @@ def generate_local_embeddings(text, model_name, pooling_mode, dim_count, max_con
         # Optional: Helps with task submission performance on Arc
         os.environ["SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS"] = "1"
         #os.environ["GGML_SYCL_DEBUG"] = "1"
-        os.environ["SYCL_UR_USE_LEVEL_ZERO_V2"] = "1"
-        os.environ["UR_L0_USE_RELAXED_ALLOCATION_LIMITS"] = "1"
+        #os.environ["SYCL_UR_USE_LEVEL_ZERO_V2"] = "1" #just uncommented 4/25/26 for stability reasons on e5 large v2 or others
+        #os.environ["UR_L0_USE_RELAXED_ALLOCATION_LIMITS"] = "1" #just uncommented 4/25/26 for stability reasons on e5 large v2 or others
         os.environ["ZES_ENABLE_SYSMAN"] = "1"
         os.environ["GGML_SYCL_DEVICE"] = "0" # Forces the first Intel GPU
         if(model_name == "e5-large-v2"):
-            os.environ["GGML_SYCL_F16_ACC"] = "0"
+            #os.environ["GGML_SYCL_F16_ACC"] = "0" #just disabled for 4/25/26 for stability reasons on e5 large v2 or others
+            os.environ["GGML_SYCL_DEVICE"] = "-1" #added this 4/25/26 so that it forces CPU for e5 large v2
     
     #sets up some parameters
     if(TOKEN_CONTEXT == -1):
@@ -191,7 +192,7 @@ def generate_local_embeddings(text, model_name, pooling_mode, dim_count, max_con
         #setting up engine parameters
         if(ACCELERATION_DEVICE == "xpu"): #xpu sycl backend has some bugs/quirks that require attention
             if(model_name == "e5-large-v2"):
-                engine = Llama(model_path=m_path, embedding=True, flash_attn=False, logits_all=False, pooling_type=pooling_mode, n_parallel=1, n_gpu_layers=0, n_threads=14, main_gpu=-1, offload_kqv=False, use_mmap=False, n_ctx=context_n, n_batch=1, n_ubatch=1, verbose=False)
+                engine = Llama(model_path=m_path, embedding=True, flash_attn=False, logits_all=True, pooling_type=pooling_mode, n_parallel=1, n_gpu_layers=0, n_threads=14, main_gpu=-1, offload_kqv=False, use_mmap=False, n_ctx=context_n, n_batch=1, n_ubatch=1, verbose=False)
                 #engine = Llama(model_path=m_path, embedding=True, flash_attn=False, pooling_type=pooling_mode, n_parallel=1, n_gpu_layers=0, n_threads=14, main_gpu=-1, n_ctx=context_n, n_batch=1, verbose=False)
             else:
                 engine = Llama(model_path=m_path, embedding=True, flash_attn=False, logits_all=True, pooling_type=pooling_mode, n_parallel=1, n_gpu_layers=-1, use_mmap=True, n_ctx=context_n, n_batch=BATCH_SIZE, n_ubatch=BATCH_SIZE, verbose=False)
@@ -222,19 +223,25 @@ def generate_local_embeddings(text, model_name, pooling_mode, dim_count, max_con
                             #print(len(tokens))
                             for i in range(0, len(tokens), context_n):
                                 engine.reset()
-                                res = np.array(engine.embed(engine.detokenize(tokens[i : i + context_n]).decode('utf-8', errors='replace')), dtype=data_type)
+                                raw_embed = engine.embed(engine.detokenize(tokens[i : i + context_n]).decode('utf-8', errors='replace'))
+                                #engine.reset()
+                                res = np.array(raw_embed, dtype=data_type).copy()
                                 if(res.ndim > 1):
                                     res = res.ravel()
                                 #print(res)
                                 full_text.append(res)
                                 c += 1
+                                #engine.set_cache(None)
+                                #engine.kv_cache_clear()
                         else:
                             engine.reset()
-                            res = np.array(engine.embed(line), dtype=data_type)
+                            res = np.array(engine.embed(line), dtype=data_type).copy()
                             if(res.ndim > 1):
                                 res = res.ravel()
                             full_text.append(res)
                             c += 1
+                            #engine.set_cache(None)
+                            #engine.kv_cache_clear()
                         #print("Progress: " + str(c))
                         if(c >= NUM_ROWS):
                             break
