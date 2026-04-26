@@ -700,8 +700,12 @@ def lz4_compress_list(data_list): #takes in a list
     #print("\nDEBUG: LZ4 precompressed bytes: " + str(len(group)) + " : ")
     #print(group)
     #print(BLOCK_SIZE)
-    return len(lz4.frame.compress(group, block_size=BLOCK_SIZE))
-    #return sum(len(lz4.frame.compress(a, block_size=BLOCK_SIZE)) for a in data_list)
+    compressed_size = 0
+    for i in range(0, len(group), BLOCK_SIZE):
+        block = group[i : i + BLOCK_SIZE]
+        compressed_size += len(lz4.frame.compress(block))
+    return compressed_size
+    #return sum(len(lz4.frame.compress(a)) for a in data_list)
 
 def zstd_compress_list(data_list): #takes in a list
     import zstandard as zstd
@@ -716,16 +720,9 @@ def zstd_compress_list(data_list): #takes in a list
     c = zstd.ZstdCompressor(level=3)
     total_len = len(group)
     #print("TOTAL LEN: " + str(total_len))
-    blocks = []
     for i in range(0, total_len, BLOCK_SIZE):
         block = group[i : i + BLOCK_SIZE]
-        #padding
-        if(len(block) < BLOCK_SIZE):
-            #print("BLOCK: " + str(len(block)) + " : " + str(BLOCK_SIZE))
-            block = block.ljust(BLOCK_SIZE, b'\x00')
-        #print("Before Size: " + str(len(block)))
         compressed_size += len(c.compress(block))
-        #print("After Size: " + str(len(c.compress(block))))
     
     return compressed_size
     #return len(c.compress(group))
@@ -941,23 +938,27 @@ def direct_compression(tens):
     
     #get the raw bytes
     if(BASE_TYPE == bfloat16): #account for bfloat16 casting
-        rawbytes = tens.detach().cpu().view(torch.uint16).numpy().view(bfloat16).tobytes()
+        raw_array = tens.detach().cpu().view(torch.uint16).numpy().view(bfloat16)
     else:
-        rawbytes = tens.cpu().numpy().tobytes()
-    print("DIRECT BYTES: " + str(len(rawbytes)))
+        raw_array = tens.cpu().numpy()
+    print("DIRECT BYTES: " + str(raw_array.nbytes))
+
+    #keep compression within each vector; only split further if one vector exceeds BLOCK_SIZE
+    if(raw_array.ndim == 1):
+        vector_payloads = [np.ascontiguousarray(raw_array).tobytes()]
+    else:
+        vector_payloads = [np.ascontiguousarray(raw_array[n]).tobytes() for n in range(raw_array.shape[0])]
+    total_raw_bytes = sum(len(payload) for payload in vector_payloads)
     
     #do zstd compression first
     c_z = zstd.ZstdCompressor(level=3)
     zstd_size = 0 #in bytes
-    for i in range(0, len(rawbytes), BLOCK_SIZE):
-        block = rawbytes[i : i + BLOCK_SIZE]
-        #handle with zero padding if needed
-        if(len(block) < BLOCK_SIZE):
-            block = block.ljust(BLOCK_SIZE, b'\x00')
-        
-        zstd_size += len(c_z.compress(block))
-    direc_ratio_z = round(float(zstd_size/len(rawbytes)), 3)
-    direc_perc_z = round((1-(zstd_size/len(rawbytes)))*100, 3)
+    for payload in vector_payloads:
+        for i in range(0, len(payload), BLOCK_SIZE):
+            block = payload[i : i + BLOCK_SIZE]
+            zstd_size += len(c_z.compress(block))
+    direc_ratio_z = round(float(zstd_size/total_raw_bytes), 3)
+    direc_perc_z = round((1-(zstd_size/total_raw_bytes))*100, 3)
     if(SHOW_NEGATIVE_COMPRESSION_RATIOS == False):
         direc_ratio_z = direc_ratio_z if direc_ratio_z < 1.000 else 1.000
         direc_perc_z = direc_perc_z if direc_perc_z >= 0.000 else 0.000
@@ -965,9 +966,13 @@ def direct_compression(tens):
     zstd_bits = zstd_size * 8 #size of zstd compressed in bits
     
     #then, do lz4 compression
-    lz4_size = len(lz4.frame.compress(rawbytes, block_size=BLOCK_SIZE)) #in bytes
-    direc_ratio_l = round(float(lz4_size/len(rawbytes)), 3)
-    direc_perc_l = round((1-(lz4_size/len(rawbytes)))*100, 3)
+    lz4_size = 0 #in bytes
+    for payload in vector_payloads:
+        for i in range(0, len(payload), BLOCK_SIZE):
+            block = payload[i : i + BLOCK_SIZE]
+            lz4_size += len(lz4.frame.compress(block))
+    direc_ratio_l = round(float(lz4_size/total_raw_bytes), 3)
+    direc_perc_l = round((1-(lz4_size/total_raw_bytes))*100, 3)
     if(SHOW_NEGATIVE_COMPRESSION_RATIOS == False):
         direc_ratio_l = direc_ratio_l if direc_ratio_l < 1.000 else 1.000
         direc_perc_l = direc_perc_l if direc_perc_l >= 0.000 else 0.000
