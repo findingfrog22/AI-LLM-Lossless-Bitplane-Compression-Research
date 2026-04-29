@@ -192,12 +192,17 @@ def generate_local_embeddings(text, model_name, pooling_mode, dim_count, max_con
         #setting up engine parameters
         if(ACCELERATION_DEVICE == "xpu"): #xpu sycl backend has some bugs/quirks that require attention
             if(model_name == "e5-large-v2"):
+                #engine = Llama(model_path=m_path, embedding=True, pooling_type=pooling_mode, n_gpu_layers=0, n_threads=14, main_gpu=-1, n_ctx=context_n, n_batch=BATCH_SIZE, n_ubatch=BATCH_SIZE, verbose=False)
+                #engine = Llama(model_path=m_path, embedding=True, pooling_type=pooling_mode, n_gpu_layers=0, main_gpu=-1, n_ctx=context_n, n_batch=BATCH_SIZE, n_ubatch=BATCH_SIZE, verbose=False)
                 engine = Llama(model_path=m_path, embedding=True, flash_attn=False, logits_all=True, pooling_type=pooling_mode, n_parallel=1, n_gpu_layers=0, n_threads=14, main_gpu=-1, offload_kqv=False, use_mmap=False, n_ctx=context_n, n_batch=1, n_ubatch=1, verbose=False)
                 #engine = Llama(model_path=m_path, embedding=True, flash_attn=False, pooling_type=pooling_mode, n_parallel=1, n_gpu_layers=0, n_threads=14, main_gpu=-1, n_ctx=context_n, n_batch=1, verbose=False)
             else:
                 engine = Llama(model_path=m_path, embedding=True, flash_attn=False, logits_all=True, pooling_type=pooling_mode, n_parallel=1, n_gpu_layers=-1, use_mmap=True, n_ctx=context_n, n_batch=BATCH_SIZE, n_ubatch=BATCH_SIZE, verbose=False)
         else:
-            engine = Llama(model_path=m_path, embedding=True, pooling_type=pooling_mode, n_gpu_layers=-1, main_gpu=0, n_ctx=context_n, n_batch=BATCH_SIZE, n_ubatch=BATCH_SIZE, verbose=False)
+            if(model_name == "e5-large-v2"):
+                engine = Llama(model_path=m_path, embedding=True, pooling_type=pooling_mode, n_gpu_layers=0, main_gpu=-1, n_ctx=context_n, n_batch=BATCH_SIZE, n_ubatch=BATCH_SIZE, verbose=False)
+            else:
+                engine = Llama(model_path=m_path, embedding=True, pooling_type=pooling_mode, n_gpu_layers=-1, main_gpu=0, n_ctx=context_n, n_batch=BATCH_SIZE, n_ubatch=BATCH_SIZE, verbose=False)
         
         if((pooling_mode == 1) or (pooling_mode == 2)):
             #text = ''.join(text[:NUM_ROWS])
@@ -254,6 +259,7 @@ def generate_local_embeddings(text, model_name, pooling_mode, dim_count, max_con
             else: #other backends can do all the embeddings at once
                 if(CHUNKING_MODE == True): #not tested yet
                     full_text = []
+                    c = 0
                     for line in total_text:
                         if(prefix != 'None'):
                             line = prefix + line
@@ -270,12 +276,17 @@ def generate_local_embeddings(text, model_name, pooling_mode, dim_count, max_con
                                 res = engine.create_embedding(chunk_str)
                                 vec = np.array(res['data'][0]['embedding'], dtype=data_type)
                                 full_text.append(vec)
+                                c += 1
                         else:
                             # Rule: Even for short lines, reset to ensure no cross-row leakage
                             engine.reset()
                             res = engine.create_embedding(line)
                             vec = np.array(res['data'][0]['embedding'], dtype=data_type)
                             full_text.append(vec)
+                            c += 1
+                        
+                        if(c >= NUM_ROWS):
+                            break
 
                     return np.vstack(full_text).astype(data_type)
                 elif(CHUNKING_MODE == False): #still need to adjust this one
@@ -700,7 +711,13 @@ def lz4_compress_list(data_list): #takes in a list
     #print("\nDEBUG: LZ4 precompressed bytes: " + str(len(group)) + " : ")
     #print(group)
     #print(BLOCK_SIZE)
-    return len(lz4.frame.compress(group, block_size=BLOCK_SIZE))
+    compressed_size = 0
+    for i in range(0, len(group), BLOCK_SIZE):
+        block = group[i : i + BLOCK_SIZE]
+        #if(len(block) < BLOCK_SIZE): #commented out for now 4/27/26
+            #block = block.ljust(BLOCK_SIZE, b'\x00')
+        compressed_size += len(lz4.frame.compress(block))
+    return compressed_size
     #return sum(len(lz4.frame.compress(a, block_size=BLOCK_SIZE)) for a in data_list)
 
 def zstd_compress_list(data_list): #takes in a list
@@ -720,9 +737,9 @@ def zstd_compress_list(data_list): #takes in a list
     for i in range(0, total_len, BLOCK_SIZE):
         block = group[i : i + BLOCK_SIZE]
         #padding
-        if(len(block) < BLOCK_SIZE):
+        #if(len(block) < BLOCK_SIZE): #commented out for now 4/27/26
             #print("BLOCK: " + str(len(block)) + " : " + str(BLOCK_SIZE))
-            block = block.ljust(BLOCK_SIZE, b'\x00')
+            #block = block.ljust(BLOCK_SIZE, b'\x00')
         #print("Before Size: " + str(len(block)))
         compressed_size += len(c.compress(block))
         #print("After Size: " + str(len(c.compress(block))))
@@ -941,23 +958,30 @@ def direct_compression(tens):
     
     #get the raw bytes
     if(BASE_TYPE == bfloat16): #account for bfloat16 casting
-        rawbytes = tens.detach().cpu().view(torch.uint16).numpy().view(bfloat16).tobytes()
+        raw_array = tens.detach().cpu().view(torch.uint16).numpy().view(bfloat16)
     else:
-        rawbytes = tens.cpu().numpy().tobytes()
-    print("DIRECT BYTES: " + str(len(rawbytes)))
+        raw_array = tens.cpu().numpy()
+    print("DIRECT BYTES: " + str(raw_array.nbytes))
+    
+    #keep compression within each vector; only split further if one vector exceeds BLOCK_SIZE
+    if(raw_array.ndim == 1):
+        vector_payloads = [np.ascontiguousarray(raw_array).tobytes()]
+    else:
+        vector_payloads = [np.ascontiguousarray(raw_array[n]).tobytes() for n in range(raw_array.shape[0])]
+    total_raw_bytes = sum(len(payload) for payload in vector_payloads)
     
     #do zstd compression first
     c_z = zstd.ZstdCompressor(level=3)
     zstd_size = 0 #in bytes
-    for i in range(0, len(rawbytes), BLOCK_SIZE):
-        block = rawbytes[i : i + BLOCK_SIZE]
-        #handle with zero padding if needed
-        if(len(block) < BLOCK_SIZE):
-            block = block.ljust(BLOCK_SIZE, b'\x00')
-        
-        zstd_size += len(c_z.compress(block))
-    direc_ratio_z = round(float(zstd_size/len(rawbytes)), 3)
-    direc_perc_z = round((1-(zstd_size/len(rawbytes)))*100, 3)
+    for payload in vector_payloads:
+        for i in range(0, len(payload), BLOCK_SIZE):
+            block = payload[i : i + BLOCK_SIZE]
+            #handle with zero padding if needed
+            #if(len(block) < BLOCK_SIZE): #commented out zero padding for 4/27/26
+                #block = block.ljust(BLOCK_SIZE, b'\x00')
+            zstd_size += len(c_z.compress(block))
+    direc_ratio_z = round(float(zstd_size/total_raw_bytes), 3)
+    direc_perc_z = round((1-(zstd_size/total_raw_bytes))*100, 3)
     if(SHOW_NEGATIVE_COMPRESSION_RATIOS == False):
         direc_ratio_z = direc_ratio_z if direc_ratio_z < 1.000 else 1.000
         direc_perc_z = direc_perc_z if direc_perc_z >= 0.000 else 0.000
@@ -965,9 +989,13 @@ def direct_compression(tens):
     zstd_bits = zstd_size * 8 #size of zstd compressed in bits
     
     #then, do lz4 compression
-    lz4_size = len(lz4.frame.compress(rawbytes, block_size=BLOCK_SIZE)) #in bytes
-    direc_ratio_l = round(float(lz4_size/len(rawbytes)), 3)
-    direc_perc_l = round((1-(lz4_size/len(rawbytes)))*100, 3)
+    lz4_size = 0 #in bytes
+    for payload in vector_payloads:
+        for i in range(0, len(payload), BLOCK_SIZE):
+            block = payload[i : i + BLOCK_SIZE]
+            lz4_size += len(lz4.frame.compress(block))
+    direc_ratio_l = round(float(lz4_size/total_raw_bytes), 3)
+    direc_perc_l = round((1-(lz4_size/total_raw_bytes))*100, 3)
     if(SHOW_NEGATIVE_COMPRESSION_RATIOS == False):
         direc_ratio_l = direc_ratio_l if direc_ratio_l < 1.000 else 1.000
         direc_perc_l = direc_perc_l if direc_perc_l >= 0.000 else 0.000
