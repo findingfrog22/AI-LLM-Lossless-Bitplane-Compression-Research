@@ -52,6 +52,11 @@ CHUNKING_MODE = True
 # - True: Uses sentence-based chunking, (Used for research, preserves semantic meaning) [default]
 # - False: Uses size/token-based chunking, (Typically used in RAG industry, loses semantic meaning)
 
+#multimodal settings
+SAMPLE_RATE = -1 #default is 1
+#SAMPLE_RATE is how frequently the frame gets sampled for videos (in hz i think)
+# if you put -1, it samples every second
+
 #quantization settings
 BASE_TYPE = torch.float32 #torch.float32 is default, will autochange during shape detection (embedding models will use their defaults)
 QUANTIZATION_TYPE = torch.int8 #You change this value, this is the resulting quantized values [Default, torch.int8]
@@ -181,7 +186,9 @@ def generate_local_embeddings(text, model_name, pooling_mode, dim_count, max_con
             "bge-m3": ("gpustack/bge-m3-GGUF", "bge-m3-FP16.gguf"),
             "gemma-3": ("second-state/embeddinggemma-300m-GGUF", "embeddinggemma-300m-f16.gguf"),
             "snowflake-arctic-embed-v2.0": ("Casual-Autopsy/snowflake-arctic-embed-l-v2.0-gguf", "snowflake-arctic-embed-l-v2.0-f32.gguf"),
-            "harrier-oss-v1-0.6b": ("SuperPauly/harrier-oss-v1-0.6b-gguf", "harrier-oss-v1-0.6B-BF16.gguf")
+            "harrier-oss-v1-0.6b": ("SuperPauly/harrier-oss-v1-0.6b-gguf", "harrier-oss-v1-0.6B-BF16.gguf"),
+            "qwen3-8b": ("Qwen/Qwen3-Embedding-8B-GGUF", "Qwen3-Embedding-8B-f16.gguf"),
+            "gemma-2": ("alamios/gemma-2-9b-it-GGUF-f16", "gemma-2-9b-it.f16.gguf")
         }
         #original qwen3 8B: ("Qwen/Qwen3-Embedding-8B-GGUF", "Qwen3-Embedding-8B-f16.gguf")
         #original gemma 2 embed 9B: ("alamios/gemma-2-9b-it-GGUF-f16", "gemma-2-9b-it.f16.gguf")
@@ -297,6 +304,283 @@ def generate_local_embeddings(text, model_name, pooling_mode, dim_count, max_con
             text = ''.join(text[:NUM_ROWS])
         return np.array(engine.create_embedding(text)['data'][0]['embedding'])
 
+def generate_multimodal_embeddings(file_path, model_name, medium, max_context, native_context, data_type, file_extension):
+    import os
+    import json
+    import io
+    import numpy as np
+    import pandas as pd
+    import zstandard as zstd
+    from pathlib import Path
+    import sentence_transformers
+    from ml_dtypes import bfloat16
+    """Checks local 'models' folder, downloads if missing, and runs inference."""
+    script_dir = Path(__file__).parent.resolve()
+    model_dir = script_dir / "models"
+    model_dir.mkdir(exist_ok=True)
+    proj_dir = model_dir / "multimodal"
+    proj_dir.mkdir(exist_ok=True)
+    
+    #sets up some parameters
+    if(TOKEN_CONTEXT == -1):
+        context_n = native_context
+    else:
+        context_n = min(TOKEN_CONTEXT, max_context)
+    
+    if model_name in ["qwen3-vl"]:
+        from llama_cpp import Llama
+        from huggingface_hub import hf_hub_download
+        import llama_cpp
+        
+        configs = {
+            "qwen3-vl": {"repo": "Qwen/Qwen3-VL-4B-Instruct-GGUF",
+                         "files": ["Qwen3VL-4B-Instruct-F16.gguf", "mmproj-Qwen3VL-4B-Instruct-F16.gguf"]}
+        }
+        downloaded_paths = []
+        configuration = configs.get(model_name)
+        for file in configuration["files"]:
+            path = hf_hub_download(repo_id=configuration["repo"], filename=file, local_dir=str(proj_dir))
+            downloaded_paths.append(path)
+        
+        if(model_name == "qwen3-vl"):
+            if(ACCELERATION_DEVICE != "cpu"):
+                engine = Llama(model_path=downloaded_paths[0], clip_model_path=downloaded_paths[1], n_gpu_layers=-1, embedding=True, n_ctx=context_n, verbose=False)
+            else:
+                engine = Llama(model_path=downloaded_paths[0], clip_model_path=downloaded_paths[1], n_gpu_layers=0, embedding=True, n_ctx=context_n, verbose=False)
+            
+            global NUM_ROWS
+            import base64
+            if(medium == "image"):
+                with open(file_path, "rb") as f:
+                    image_bytes = base64.b64encode(f.read()).decode('utf-8')
+                if(file_extension == ".jpg"):
+                    raw_vector = engine.create_embedding(input=f"data:image/jpeg;base64,{image_bytes}")
+                elif(file_extension == ".png"):
+                    raw_vector = engine.create_embedding(input=f"data:image/png;base64,{image_bytes}")
+                #res = engine.create_embedding(input=[{"type": "image_url", "image_url": "file://" + file_path}])
+                #NUM_ROWS = 1
+                #print(type(raw_vector['data'][0]['embedding']))
+                #print(len(raw_vector['data'][0]['embedding']))
+                #print(type(raw_vector['data'][0]['embedding'][0]))
+                #print(len(raw_vector['data'][0]['embedding'][0]))
+                #print(raw_vector['data'][0]['embedding'][0])
+                embeddings = []
+                r = 0
+                for line in raw_vector['data'][0]['embedding']:
+                    embeddings.append(np.array(line, dtype=data_type))
+                    r += 1
+                    if(r >= NUM_LINES):
+                        break
+                NUM_ROWS = min(NUM_ROWS, r)
+                result = np.vstack(embeddings).astype(data_type)
+                #print(result.shape)
+                return result
+                #return res['data'][0]['embedding']
+            elif(medium == "video"):
+                import cv2
+                import base64
+                import numpy as np
+                global SAMPLE_RATE
+                cap = cv2.VideoCapture(file_path)
+                fps = cap.get(cv2.CAP_PROP_FPS)
+                if(SAMPLE_RATE == -1):
+                    SAMPLE_RATE = fps #ex: samples at every 30 or 60 frames
+                all_frame_embeddings = []
+                frame_count = 0
+                while((cap.isOpened()) and (frame_count <= NUM_LINES)):
+                    ret, frame = cap.read()
+                    if not ret: break
+                    #only process frames based on the sample rate
+                    if(frame_count % SAMPLE_RATE == 0):
+                        #convert frame to base64
+                        _, buffer = cv2.imencode('.jpg', frame)
+                        b64_img = base64.b64encode(buffer).decode('utf-8')
+                        data_uri = f"data:image/jpeg;base64,{b64_img}"
+                        
+                        #embed the frame
+                        res = engine.create_embedding(input=data_uri)
+                        #store the 512x2560 matrix for this frame
+                        all_frame_embeddings.append(res['data'][0]['embedding'])
+                    frame_count += 1
+                #convert a list of matrices into a single 3d array [frames, 512, 2560]
+                cap.release()
+                video_tensor = np.array(all_frame_embeddings)
+                #averages 512 embeddings per frame (so now each vector embedding represents the average of a frame)
+                output_2d = np.mean(video_tensor, axis=1)
+                NUM_ROWS = min(NUM_ROWS, output_2d.shape[0])
+                return output_2d
+            elif(medium == "audio"): #in the future, I would like it to just support generating 1 vector embedding per frame, for NUM_LINE amount of frames
+                res = engine.create_embedding(input=[{"type": "audio_url", "audio_url": {"url": file_path}}])
+                NUM_ROWS = 1
+                return res['data'][0]['embedding']
+            
+        
+        #setting up engine parameters
+        
+    elif model_name in ["imagebind"]:
+        import torch
+        import numpy as np
+        print("before library initialization")
+        from imagebind import data
+        print("after data")
+        from imagebind.models import imagebind_model
+        print("after initial model")
+        from imagebind.models.imagebind_model import ModalityType
+        #import cv2
+        #from PIL import Image
+        #import os
+        #1 initialize model on acceleration device
+        print("initialized libraries")
+        model = imagebind_model.imagebind_huge(pretrained=True)
+        model.eval()
+        model.to(ACCELERATION_DEVICE)
+        
+        #2 preprocess data using ImageBind's built-in loaders
+        print("preprocessor")
+        if(medium == "image"):
+            inputs = {ModalityType.VISION: data.load_and_transform_vision_data([file_path], ACCELERATION_DEVICE)}
+            NUM_ROWS = 1
+        elif(medium == "audio"):
+            NUM_ROWS = 1
+            inputs = {ModalityType.AUDIO: data.load_and_transform_audio_data([file_path], ACCELERATION_DEVICE)}
+        elif(medium == "video"): #in the future, I would like it to just support generating 1 vector embedding per frame, for NUM_LINE amount of frames
+            inputs = {ModalityType.VISION: data.load_and_transform_video_data([file_path], ACCELERATION_DEVICE)}
+            NUM_ROWS = 1
+        
+        #3 generate embeddings
+        print("generate embeddings")
+        with torch.no_grad():
+            embeddings = model(inputs)
+        
+        #4 return as a standard python list for your bitplane simulation
+        print("return embeddings")
+        return np.array(embeddings[ModalityType.VISION if medium == "image" or medium == "video" else ModalityType.AUDIO].tolist())
+
+    elif model_name in ["clap"]:
+        from transformers import ClapModel, ClapProcessor
+        import librosa
+        import torch
+        import numpy as np
+        
+        #1 load the model
+        #note: 'unfused' is more often stable for raw research extraction
+        model_id = "laion/clap-htsat-unfused"
+        #print("before cmodel")
+        cmodel = ClapModel.from_pretrained(model_id).to(ACCELERATION_DEVICE)
+        #print("before processor")
+        processor = ClapProcessor.from_pretrained(model_id, clean_up_tokenization_spaces=True)
+        
+        #now lets get the embeddings
+        embeddings_list = []
+        
+        #1 configuration
+        SR = 48000 #CLAP standard
+        MAX_SEC = 10 #context window
+        CHUNK_SAMPLES = MAX_SEC * SR #number of samples per chunk
+        
+        #2 load the full file into RAM
+        #print("before librosa load")
+        audio_full, sample = librosa.load(file_path, sr=SR, res_type='soxr_hq')
+        
+        #3 chunk the array using NumPy slicing
+        #this creates a list of arrays: [10s, 10s, 10s, remaining_s]
+        chunks = [audio_full[i : i + CHUNK_SAMPLES] for i in range(0, len(audio_full), CHUNK_SAMPLES)]
+        
+        #4 handle the "tail" (the last chunk, it might be incomplete)
+        #if the last chunk is < 10 seconds, the processor will pad it automatically
+        #but for research consistency, ensure it isn't too short
+        if len(chunks[-1]) < SR: #less than 1 second
+            chunks.pop() #optional: remove tiny fragment at the end
+        
+        #5 generate the (B x 512) matrix
+        #process all chunks as a single batch
+        #this sends a list of arrays to the processor
+        #print("before processor run inputs")
+        inputs = processor(audios=chunks, return_tensors="pt", sampling_rate=SR, padding=True).to(ACCELERATION_DEVICE)
+        
+        with torch.no_grad():
+            #print("before outputs cmodel get audio features")
+            outputs = cmodel.get_audio_features(**inputs)
+        
+        embedding_result = outputs.cpu().numpy() #Result shape: (B, 512)
+        
+        NUM_ROWS = min(NUM_ROWS, embedding_result.shape[0])
+        #print("Dim detected: " + str(embedding_result.shape[1]))
+        return embedding_result
+
+    elif model_name in ["clipvit-l"]:
+        import torch
+        import cv2
+        import numpy as np
+        from PIL import Image
+        from transformers import CLIPVisionModel, CLIPModel, CLIPProcessor
+        
+        #1 set up model (1024 dimensions? hidden states)
+        model_id = "openai/clip-vit-large-patch14"
+        model = CLIPModel.from_pretrained(model_id).to(ACCELERATION_DEVICE)
+        processor = CLIPProcessor.from_pretrained(model_id, clean_up_tokenization_spaces=True)
+        
+        if(medium == "image"):
+            #performs advanced RAG, (ColPali-style): patch level vectors
+            #note: real rag often applies the projection layer to patches too
+            #it will return 257 vector embeddings (number of rows). First one is the final state of the entire image. The next 256 embeddings represent finer patches of 16x16 pixels. This is accurate to real life RAG
+            image = Image.open(file_path)
+            inputs = processor(images=image, return_tensors="pt").to(ACCELERATION_DEVICE)
+            
+            with torch.no_grad():
+                #to get the 768 dimension features vectors for every patch
+                vision_outputs = model.vision_model(**inputs)
+                #last_hidden_state shape: [1, 257, 1024?]
+                last_hidden_state = vision_outputs.last_hidden_state#.squeeze(0).cpu().numpy()
+                
+                #apply the visual projection layer to all 257 tokens
+                #this mimics how 'get_image_features' works, but for every patch
+                projected_patches = model.visual_projection(last_hidden_state)
+                
+                #then normalize, Industry RAG uses L2 Normalization at the very end. This ensures cosine similarity works correctly in the database
+                projected_patches = projected_patches / projected_patches.norm(dim=-1, keepdim=True)
+                #then convert it to shape (257, 768)
+                embedding_results = projected_patches.squeeze(0).cpu().numpy()
+                NUM_ROWS = min(NUM_ROWS, embedding_results.shape[0])
+            
+            return embedding_results # (B=257, W=1024?)
+        elif(medium == "video"): #experimental, model isn't natively designed to do video, but it is possible
+            #streams video frames and returns (Frames x 1024?) matrix. No files are saved to disk
+            cap = cv2.VideoCapture(file_path)
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            if(SAMPLE_RATE == -1):
+                SAMPLE_RATE = fps #ex: samples every 30 or 60 frames
+            frame_embeddings = []
+            
+            frames_counted = 0
+            while (cap.isOpened() and (frames_counted <= NUM_LINES)):
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                
+                if(frames_counted % SAMPLE_RATE == 0):
+                    #Convert OpenCV BGR to RGB for CLIP
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    pil_img = Image.fromarray(frame_rgb)
+                
+                    inputs = processor(images=pil_img, return_tensors="pt").to(ACCELERATION_DEVICE)
+                
+                    with torch.no_grad():
+                        #real rag: the aligned 768 dimension feature vector
+                        outputs = model.get_image_features(**inputs)
+                        frame_embeddings.append(outputs.cpu().numpy())
+                
+                frames_counted += 1
+            
+            cap.release()
+            embedding_results = np.vstack(frame_embeddings) #(B_frames, 768)
+            NUM_ROWS = min(NUM_ROWS, embedding_results.shape[0])
+            return embedding_results
+
+    else:
+        print("either this model is incomplete in implementation or it isn't supported in this simulation...")
+    pass
+
 def embedding_model_selection(file_path, Text, mode):
     import os
     import numpy as np
@@ -308,26 +592,76 @@ def embedding_model_selection(file_path, Text, mode):
     elif(mode == "dataset"):
         text = Text
     
-    pool_mapping = {"qwen3": 2, "e5-mistral": 2, "e5-large-v2": 1, "bge-m3": 2, "nomic": 1, "gemma-3": 1, "snowflake-arctic-embed-v2.0": 2, "harrier-oss-v1-0.6b": 2}
-    dim_mapping = {"qwen3": 2560, "e5-mistral": 4096, "e5-large-v2": 1024, "bge-m3": 1024, "nomic": 768, "gemma-3": 768, "snowflake-arctic-embed-v2.0": 1024, "harrier-oss-v1-0.6b": 1024}
-    context_mapping = {"qwen3": 32768, "e5-mistral": 32768, "e5-large-v2": 512, "bge-m3": 8192, "nomic": 8192, "gemma-3": 2048, "snowflake-arctic-embed-v2.0": 8192, "harrier-oss-v1-0.6b": 32768}
-    native_context_mapping = {"qwen3": 32768, "e5-mistral": 4096, "e5-large-v2": 512, "bge-m3": 8192, "nomic": 2048, "gemma-3": 2048, "snowflake-arctic-embed-v2.0": 8192, "harrier-oss-v1-0.6b": 32768}
-    datatype_mapping = {"qwen3": np.float16, "e5-mistral": np.float16, "e5-large-v2": np.float32, "bge-m3": np.float16, "nomic": np.float32, "gemma-3": np.float16, "snowflake-arctic-embed-v2.0": np.float32, "harrier-oss-v1-0.6b": bfloat16}
-    prefix_mapping = {"qwen3": 'None', "e5-mistral": 'query:', "e5-large-v2": 'query:', "bge-m3": 'None', "nomic": 'search_query:', "gemma-3": 'Retrieval-query:', "snowflake-arctic-embed-v2.0": 'None', "harrier-oss-v1-0.6b": 'None'}
+    pool_mapping = {"qwen3": 2, "e5-mistral": 2, "e5-large-v2": 1, "bge-m3": 2, "nomic": 1, "gemma-3": 1, "snowflake-arctic-embed-v2.0": 2, "harrier-oss-v1-0.6b": 2, "gemma-2": 1, "qwen3-8b": 2}
+    dim_mapping = {"qwen3": 2560, "e5-mistral": 4096, "e5-large-v2": 1024, "bge-m3": 1024, "nomic": 768, "gemma-3": 768, "snowflake-arctic-embed-v2.0": 1024, "harrier-oss-v1-0.6b": 1024, "gemma-2": 3584, "qwen3-8b": 4096}
+    context_mapping = {"qwen3": 32768, "e5-mistral": 32768, "e5-large-v2": 512, "bge-m3": 8192, "nomic": 8192, "gemma-3": 2048, "snowflake-arctic-embed-v2.0": 8192, "harrier-oss-v1-0.6b": 32768, "gemma-2": 8192, "qwen3-8b": 32768}
+    native_context_mapping = {"qwen3": 32768, "e5-mistral": 4096, "e5-large-v2": 512, "bge-m3": 8192, "nomic": 2048, "gemma-3": 2048, "snowflake-arctic-embed-v2.0": 8192, "harrier-oss-v1-0.6b": 32768, "gemma-2": 8192, "qwen3-8b": 32768}
+    datatype_mapping = {"qwen3": np.float16, "e5-mistral": np.float16, "e5-large-v2": np.float32, "bge-m3": np.float16, "nomic": np.float32, "gemma-3": np.float16, "snowflake-arctic-embed-v2.0": np.float32, "harrier-oss-v1-0.6b": bfloat16, "gemma-2": np.float16, "qwen3-8b": np.float16}
+    prefix_mapping = {"qwen3": 'None', "e5-mistral": 'query:', "e5-large-v2": 'query:', "bge-m3": 'None', "nomic": 'search_query:', "gemma-3": 'Retrieval-query:', "snowflake-arctic-embed-v2.0": 'None', "harrier-oss-v1-0.6b": 'None', "gemma-2": 'Retrieval-query', "qwen3-8b": 'None'}
     #print(text)
-    framedata = [[2560, 32768, 32768, "CLS", "Alibaba Group", "Quite advanced"],[4096, 32768, 4096, "CLS", "Microsoft", "Used in Bing Search, and Even Copilot and RAG applications"],[1024, 512, 512, "Mean", "Microsoft", "Warning: pretty low token range"],[1024, 8192, 8192, "CLS", "Beijing Academy of Artificial Intelligence", ""],[768, 8192, 2048, "Mean", "Nomic AI", "new, and focused on performance"], [768, 2048, 2048, "Mean", "Google", "Based on Gemma 3, 308M parameters. Open Source version of Google Gemini Embedding model"], [1024, 8192, 8192, "CLS", "Snowflake", "Commonly used for large-scale RAG in industry"], [1024, 32768, 32768, "CLS", "Microsoft", "Bleeding edge for RAG applications, better than E5, released early 2026"]]
+    framedata = [[2560, 32768, 32768, "CLS", "Alibaba Group", "Quite advanced"],[4096, 32768, 4096, "CLS", "Microsoft", "Used in Bing Search, and Even Copilot and RAG applications"],[1024, 512, 512, "Mean", "Microsoft", "Warning: pretty low token range"],[1024, 8192, 8192, "CLS", "Beijing Academy of Artificial Intelligence", ""],[768, 8192, 2048, "Mean", "Nomic AI", "new, and focused on performance"], [768, 2048, 2048, "Mean", "Google", "Based on Gemma 3, 308M parameters. Open Source version of Google Gemini Embedding model"], [1024, 8192, 8192, "CLS", "Snowflake", "Commonly used for large-scale RAG in industry"], [1024, 32768, 32768, "CLS", "Microsoft", "Bleeding edge for RAG applications, better than E5, released early 2026"], [3584, 8192, 8192, "Mean", "Google", "Warning: heavy on RAM/VRAM (18.9 GB required)"], [4096, 32768, 32768, "CLS", "Alibaba Group", "Warning: heavy on RAM/VRAM (15.1 GB required)"]]
     df = pd.DataFrame(np.array(framedata))
     df.columns = ['Maximum Dims:','Maximum # Tokens:', 'Native Token Context:', 'Pooling Type:', 'Source:', 'Notes:']
-    df.index = ['0.) Qwen3 Embedding 4B (FP16): ', '1.) E5 Mistral 7B (FP16): ', '2.) E5 Large V2 (FP32): ', '3.) BAAI BGE-M3 (FP16): ', '4.) Nomic Embed V1.5 (FP32): ', '5.) EmbeddingGemma 300M (FP16):', '6.) Snowflake Arctic Embedding L V2.0 (FP32):', '7.) Harrier OSS V1 0.6B (BF16):'] #rows
+    df.index = ['0.) Qwen3 Embedding 4B (FP16): ', '1.) E5 Mistral 7B (FP16): ', '2.) E5 Large V2 (FP32): ', '3.) BAAI BGE-M3 (FP16): ', '4.) Nomic Embed V1.5 (FP32): ', '5.) EmbeddingGemma 300M (FP16):', '6.) Snowflake Arctic Embedding L V2.0 (FP32):', '7.) Harrier OSS V1 0.6B (BF16):', '8.) Gemma 2 Embed 9B (FP16):', '9.) Qwen3 Embed 8B (FP16):'] #rows
     pd.set_option('display.max_columns', None)
     pd.set_option('display.width', 150)
     print(df)
     choice = int(input("Enter your number choice here: "))
             
-    options = ["qwen3","e5-mistral","e5-large-v2","bge-m3","nomic","gemma-3","snowflake-arctic-embed-v2.0","harrier-oss-v1-0.6b"]
+    options = ["qwen3","e5-mistral","e5-large-v2","bge-m3","nomic","gemma-3","snowflake-arctic-embed-v2.0","harrier-oss-v1-0.6b","gemma-2","qwen3-8b"]
     print("before generating local embeddings")
     
     return generate_local_embeddings(text, options[choice], pool_mapping[options[choice]], dim_mapping[options[choice]], context_mapping[options[choice]], native_context_mapping[options[choice]], datatype_mapping[options[choice]], prefix_mapping[options[choice]])
+
+def multimodal_model_selection(file_path, medium, file_extension):
+    import os
+    import numpy as np
+    import pandas as pd
+    from ml_dtypes import bfloat16
+    #what we kinda have:
+    # - qwen3-vl
+    # - imagebind
+    # - clipvit-l
+    # - gemma-3 [cannot use]
+    # - clap
+    print("NOTE: multimodal support is still in very early phase of developement. Expect lots of issues")
+    print("NOTE: imagebind is highly unstable, may require direct library modifications due to its deprecated nature (3 years old)")
+    
+    audio_compatibility = {"qwen3-vl": False, "imagebind": True, "clipvit-l": False, "gemma-3": True, "clap": True}
+    image_compatibility = {"qwen3-vl": True, "imagebind": True, "clipvit-l": True, "gemma-3": True, "clap": False}
+    video_compatibility = {"qwen3-vl": True, "imagebind": True, "clipvit-l": True, "gemma-3": True, "clap": False}
+    #note:clipvit-l doesn't support video
+    completed = {"qwen3-vl": True, "imagebind": True, "clipvit-l": True, "gemma-3": False, "clap": True}
+    
+    all_models = ["qwen3-vl", "imagebind", "clipvit-l", "gemma-3", "clap"]
+    
+    options = []
+    if(medium == "image"):
+        options = [m for m in all_models if (image_compatibility[m] == True) and (completed[m] == True)]
+    elif(medium == "audio"):
+        options = [m for m in all_models if (audio_compatibility[m] == True) and (completed[m] == True)]
+    elif(medium == "video"):
+        print("NOTE: for video computation, please keep your NUM_LINES parameter low, like ~10 or so, eats up lots of RAM (SAMPLE_RATE is also important)")
+        print("NOTE: CLIP ViT-L/14 doesn't natively support video, video support is experimental")
+        options = [m for m in all_models if (video_compatibility[m] == True) and (completed[m] == True)]
+    
+    
+    model_information = {"qwen3-vl": {"dim": 2560, "max_context": 32768, "native_context": 32768, "token_pooling": 2, "data_type": np.float16, "source": "Alibaba", "note": "Instruct-based, work in progress. Images are split into 512 chunks, Videos are 1 vector per sampled frame"}, "imagebind": {"dim": 1024, "max_context": 32768, "native_context": 32768, "token_pooling": 2, "data_type": np.float16, "source": "Meta", "note": "universal, work in progress. Highly unstable. 1 vector embedding per file (broad)"}, "clipvit-l": {"dim": 768, "max_context": 77, "native_context": 77, "token_pooling": 2, "data_type": np.float16, "source": "OpenAI", "note": "Work in progress. Does 257 vectors for image (1st vector is entire image embedding, the next 256 vectors are for each 16x16 pixel chunk for detailed image classification (advanced RAG retrieval)). For video, 1 vector per sampled frame"}, "gemma-3": {"dim": 768, "max_context": 2048, "native_context": 2048, "token_pooling": 1, "data_type": np.float16, "source": "Google", "note": "Incomplete, doesn't support multimodal in the open sourced version, needs API gemini version"}, "clap": {"dim": 512, "max_context": 512, "native_context": 512, "token_pooling": 1, "data_type": np.float16, "source": "None", "note": "Incomplete, audio only, may also use CLS pooling. CLAP does 1 vector per 10 second sample, does chunks of 10 seconds."}}
+    c = 0
+    selection_menu = []
+    for model in options:
+        selection_menu.append("\n" + str(c) + ".) " + str(model) + " --> " + str(model_information[model]))
+        c += 1
+    print("NOTE: for token pooling: \n- 0.) No pooling\n - 1.) Mean\n- 2.) CLS")
+    print("NOTE: imagebind doesn't have any publicly documented max token context")
+    for s in selection_menu:
+        print(s)
+    selection = int(input("Select a model by number: "))
+    model_name = options[selection]
+    max_context = model_information[model_name]["max_context"]
+    native_context = model_information[model_name]["native_context"]
+    data_type = model_information[model_name]["data_type"]
+    return generate_multimodal_embeddings(file_path, model_name, medium, max_context, native_context, data_type, file_extension)
 
 def dataset_embedding(file_path, precomputed):
     import os
@@ -467,6 +801,20 @@ def dataset_embedding(file_path, precomputed):
             df = feather.read_feather(file_path)
             key = _find_vector_column(df.iloc[0])
             return np.stack(df[key].values)
+        
+        #multimodal stuff now
+        elif ext == '.jpg':
+            return multimodal_model_selection(file_path, "image", ext)
+        elif ext == '.png':
+            return multimodal_model_selection(file_path, "image", ext)
+        elif ext == '.wav':
+            return multimodal_model_selection(file_path, "audio", ext)
+        elif ext == '.mp3':
+            return multimodal_model_selection(file_path, "audio", ext)
+        elif ext == '.mov':
+            return multimodal_model_selection(file_path, "video", ext)
+        elif ext == '.mp4':
+            return multimodal_model_selection(file_path, "video", ext)
 
         else:
             print(f"Unsupported extension: {ext}")
