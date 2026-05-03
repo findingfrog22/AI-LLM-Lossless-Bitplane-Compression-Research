@@ -1,0 +1,17 @@
+To do 5_4+_26: (B0.9.9 - Beta)(FinalSimulation.py)
+- Extensively test Nvidia CUDA compatibility
+
+Future roadmap: (R1.0.0+)
+- R1.0.0:
+- Clean up comments, settings/parameters, and GUI.
+- First full release on github
+- R1.0.1:
+- Extensively test AMD ROCm compatibility
+- R1.1.0:
+- Add Elastic Precision Retrieval support
+
+Potential Experimental:
+- Add an option to only do compression analytics on the first few MSBs (controllable with settings)(brings it closer to TRACE)(Elastic Precision Retrieval)
+- (maybe?) add some more metrics: (brings it closer to TRACE)
+	- bandwidth savings
+	- compression timing/latency
