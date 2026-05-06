@@ -1,0 +1,29 @@
+To do 5_7+_26: (R1.0.0 - Full Release)(FinalSimulation.py --> RAGEmbeddingSimulation.py)
+- Clean up code comments
+- Clean up code UI
+- Remove commented out and unnecessary code
+
+Documentation side [R1.0.0]:
+- Update Github home page
+- Add library requirements + minimum versions
+- Add page of current known issues
+- Create usage notes (how to use, compatibility, system requirements, etc)
+- Slightly update license to require your name to be mentioned when forked
+- Create Full-release R1.0.0 + Channelog
+- Update to-do next (R1.x.x+)
+
+
+Future roadmap: (R1.0.0+)
+- R1.0.0:
+- Clean up comments, settings/parameters, and GUI.
+- First full release on github
+- R1.0.1:
+- Extensively test AMD ROCm compatibility
+- R1.1.0:
+- Add Elastic Precision Retrieval support
+
+Potential Experimental:
+- Add an option to only do compression analytics on the first few MSBs (controllable with settings)(brings it closer to TRACE)(Elastic Precision Retrieval)
+- (maybe?) add some more metrics: (brings it closer to TRACE)
+	- bandwidth savings
+	- compression timing/latency
