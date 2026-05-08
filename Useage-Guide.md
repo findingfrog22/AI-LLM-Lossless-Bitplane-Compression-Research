@@ -1,5 +1,7 @@
 This guide is for this simulation: RAGEmbeddingSimulation.py R1.0.0+
 
+NOTE: keep in mind that you must source your own files for embeddings (.parquet, .txt, etc). It must be in a similar relative directory to the simulation file itself
+
 Hardware Requirements:
 - Of course, for this simulation, stronger hardware is always better, but here is the recommended baseline
 Baseline:
