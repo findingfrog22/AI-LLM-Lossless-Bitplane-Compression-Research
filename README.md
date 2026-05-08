@@ -1,5 +1,5 @@
 RPI Spring 2026 URP: 
-This research is heavily involved in addressing the current memory bottlenecks of current AI inferencing solutions. The end goal is to have specialized hardware built into SSD controllers to compress and decompress vector embeddings and other inference data to reduce its memory footprint, reduce bandwidth constraints, and improve $/GB metrics.
+This research is heavily involved in addressing the current memory bottlenecks of current AI inferencing solutions for RAG retrieval of vector embeddings for RAG databases. The end goal is to have specialized hardware built into SSD controllers to compress and decompress vector embeddings and other inference data to reduce its memory footprint, reduce bandwidth constraints, and improve $/GB metrics.
 
 Current Goal:
 - Determine the effects of bitplaning on the compressibility of vector embeddings for LZ4 and ZSTD compression codecs of various block sizes
