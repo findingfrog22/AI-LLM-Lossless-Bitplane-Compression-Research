@@ -4,6 +4,20 @@ This research is heavily involved in addressing the current memory bottlenecks o
 Current Goal:
 - Determine the effects of bitplaning on the compressibility of vector embeddings for LZ4 and ZSTD compression codecs of various block sizes
 
+Results:
+- Compression results show up to a 53% reduction in memory losslessly
+- Experimental multimodal embedding results show up to a 92% reduction in memory
+
+Conclusions:
+- Bitplaning only showed better results when not combined with lossy quantization.
+- Bitplaning vastly improves LZ4 compressibility regardless if it is quantized or not.
+
+See the results of this research in this repository (slides, data, working document, code, etc)
+
+Future Goals:
+- Implementing Elastic Precision Retrieval to vector embedding RAG retrieval to alleviate bandwidth further
+- Implementing computational pipeline into TRACE Interface for higher memory and bandwidth savings
+
 Datasets for this project:
 - Wikipedia DPR
 - Fineweb Edu Embeddings
@@ -54,14 +68,30 @@ Performance and Implementation Details:
 - --> GPU mainly accelerates matrix and tensor manipulations and calculations on large blocks of data
 - --> GPU Support 
 - --> CPU mainly performs data conversion/transformation operations in a pool of multiple threads, processes GPU output in a Python and user readable format
+- For new users, I highly recommend Nvidia CUDA (for speed) or CPU (for reliability). The other backends are much harder to get set up and working. CUDA is fully validated for even the experimental parts of this simulation.
 
 Recommended Hardware Specifications:
+Hardware Requirements:
+- Of course, for this simulation, stronger hardware is always better, but here is the recommended baseline
+Baseline Specifications:
+- CPU: 8 cores or higher (AVX2 or newer)
+- GPU: Intel ARC iGPU (ArrowLake or later), AMD HD 780m (Ryzen 7000 series or later)
+- RAM: 16GB+ (32 Recommended)
+- SSD: 100+GB (To hold embedding models, source data, etc)
+- OS: Windows 11 or Linux (kernel 6.8+)
+  
+Recommended Specifications:
+- CPU: 16+ Cores (AVX512 or AVX10 reccommended)
+- GPU: Nvidia RTX 3000 series or newer (with CUDA 13.0+ support), Intel ARC A/B series, AMD RX 7700 and higher
+- VRAM Requirements: 16GB (recommended), 32GB+ (for heavier models like Qwen3 8B or Gemma 2 9B)
+- RAM: 32GB+ (64-128GB recommended for larger files)
+- SSD: 200GB+ (to hold all embedding models and source files)
+- OS: Linux (newer kernels, 6.11+)
 
 Library Notes:
 - There are so many libraries used in this simulation, that it would not be countable for me, so I will include the most important libraries that require the most work to set up:
 - llama_cpp python: You need to custom compile a GPU accelerated one from source. The default one only uses CPU
 - pytorch 2.11.0+ or newer: Must also be compiled for GPU acceleration, as the default one only does CPU.
-
 
 Known Issues:
 - Intel ARC backend is broken on certain text embedding models (E5 large v2, embeddinggemma, harrier OSS)
