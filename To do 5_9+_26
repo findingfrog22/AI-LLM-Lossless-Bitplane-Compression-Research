@@ -1,0 +1,14 @@
+I am handing off further developement of this simulation to whoever wants to fork it. It is open sourced after all.
+
+To do 5_9+_26: (R1.0.1 - Compatiblity update)
+- Extensively test AMD ROCm compatibility
+
+Future Roadmap:
+- R1.1.0:
+- Add Elastic Precision Retrieval support
+
+Potential Experimental:
+- Add an option to only do compression analytics on the first few MSBs (controllable with settings)(brings it closer to TRACE)(Elastic Precision Retrieval)
+- (maybe?) add some more metrics: (brings it closer to TRACE)
+	- bandwidth savings
+	- compression timing/latency
