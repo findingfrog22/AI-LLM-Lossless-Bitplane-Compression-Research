@@ -18,7 +18,7 @@ Future Goals:
 - Implementing Elastic Precision Retrieval to vector embedding RAG retrieval to alleviate bandwidth further
 - Implementing computational pipeline into TRACE Interface for higher memory and bandwidth savings
 
-Datasets for this project:
+Datasets for this project:*
 - Wikipedia DPR
 - Fineweb Edu Embeddings
 - MS MARCO V2.1 English V3 (Based on TREC RAG 2024)
@@ -30,6 +30,7 @@ Datasets for this project:
 - BEIR touche-2020
 - BEIR dbpedia
 - BEIR fever
+*Even though the simulation will download the embedding models for you, keep in mind that you must download your own source data to do embeddings with (.parquet, .txt, etc).
 
 Embedding Models Included in this project:
 Text Embedding Models (Validated for research):
