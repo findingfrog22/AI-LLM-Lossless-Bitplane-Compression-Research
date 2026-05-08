@@ -30,7 +30,7 @@ Datasets for this project:*
 - BEIR touche-2020
 - BEIR dbpedia
 - BEIR fever
-*Even though the simulation will download the embedding models for you, keep in mind that you must download your own source data to do embeddings with (.parquet, .txt, etc).
+*Even though the simulation will download the embedding models for you, keep in mind that you must download your own source data to do embeddings with (.parquet, .txt, etc). It must be in a similar relative directory to the simulation file itself
 
 Embedding Models Included in this project:
 Text Embedding Models (Validated for research):
